@@ -91,16 +91,19 @@ class PPO:
         else:
             self.symmetry = None
 
-        # PPO components
+        # PPO components 
+        # policy其实是ActorCritic
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
+        # 创建经验回放池存储类
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
+        # 记录PPO超参数
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
@@ -150,7 +153,7 @@ class PPO:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
-        # Record the rewards and dones
+        # Record the rewards and dones TODO:搞懂done是什么
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones

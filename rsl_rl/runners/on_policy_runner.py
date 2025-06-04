@@ -46,10 +46,12 @@ class OnPolicyRunner:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
         # resolve dimensions of observations
+        # 获取观测值
         obs, extras = self.env.get_observations()
         num_obs = obs.shape[1]
 
         # resolve type of privileged observations
+        # 设置特权观测值的获取方式
         if self.training_type == "rl":
             if "critic" in extras["observations"]:
                 self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
@@ -62,18 +64,22 @@ class OnPolicyRunner:
                 self.privileged_obs_type = None
 
         # resolve dimensions of privileged observations
+        # 获取特权观测值的维度
         if self.privileged_obs_type is not None:
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
 
         # evaluate the policy class
+        # 从cfg中取出策略类名称，并得到类指针，默认值是ActorCritic
         policy_class = eval(self.policy_cfg.pop("class_name"))
+        # 实例化策略类
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # resolve dimension of rnd gated state
+        # RND算法相关的内容 TODO: 看RND论文
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             # check if rnd gated state is present
             rnd_state = extras["observations"].get("rnd_state")
@@ -87,30 +93,37 @@ class OnPolicyRunner:
             self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
 
         # if using symmetry then pass the environment config object
+        # 如果使用了对称策略则传递环境类 TODO:搞懂对称策略
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
         # initialize algorithm
+        # 从cfg中取出算法类名称，并得到类指针，默认值是PPO
         alg_class = eval(self.alg_cfg.pop("class_name"))
+        # 实例化算法类
         self.alg: PPO | Distillation = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
         # store training configuration
+        # 读取部分超参数
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
+        # 是否使用经验归一化
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
             self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
                 self.device
             )
         else:
+            # Identity输入什么就输出什么
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
         # init storage and model
+        # 初始化经验回放
         self.alg.init_storage(
             self.training_type,
             self.env.num_envs,
@@ -133,6 +146,7 @@ class OnPolicyRunner:
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
+        # 初始化日志记录器 TODO:弄清楚别的怎么用
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
             self.logger_type = self.cfg.get("logger", "tensorboard")
@@ -156,22 +170,26 @@ class OnPolicyRunner:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
 
         # check if teacher is loaded
+        # 如果是蒸馏训练，则检查教师模型是否加载
         if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
             raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
         # randomize initial episode lengths (for exploration)
+        # 随机化初始的episode长度（用于探索）
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
         # start learning
+        # 获取观测值和特权观测值
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
+        # 用于记录奖励和存活长度的缓冲区
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
@@ -186,6 +204,7 @@ class OnPolicyRunner:
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # Ensure all parameters are in-synced
+        # 多GPU训练时同步所有GPU上的参数
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
@@ -199,15 +218,17 @@ class OnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
+                # 一个学习迭代包含多个环境步数
                 for _ in range(self.num_steps_per_env):
-                    # Sample actions
+                    # Sample actions 网络输出动作值
                     actions = self.alg.act(obs, privileged_obs)
-                    # Step the environment
+                    # Step the environment 环境根据动作值输出五元组
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # perform normalization
+                    # perform normalization 观测值归一化 TODO:怎么归一化
                     obs = self.obs_normalizer(obs)
+                    # 如果有特权观测值，对其进行归一化
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(
                             infos["observations"][self.privileged_obs_type].to(self.device)
@@ -215,7 +236,7 @@ class OnPolicyRunner:
                     else:
                         privileged_obs = obs
 
-                    # process the step
+                    # process the step 记录五元组
                     self.alg.process_env_step(rewards, dones, infos)
 
                     # Extract intrinsic rewards (only for logging)
@@ -254,11 +275,11 @@ class OnPolicyRunner:
                 collection_time = stop - start
                 start = stop
 
-                # compute returns
+                # compute returns 如果算法是PPO，计算优势函数
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs)
 
-            # update policy
+            # update policy 更新网络
             loss_dict = self.alg.update()
 
             stop = time.time()
@@ -283,7 +304,7 @@ class OnPolicyRunner:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        # Save the final model after training
+        # Save the final model after training 训练结束后保存权重文件
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 

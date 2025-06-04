@@ -33,11 +33,12 @@ class ActorCritic(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
+        # 返回已经实例化的激活函数类
         activation = resolve_nn_activation(activation)
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
-        # Policy
+        # Policy 构建actor网络
         actor_layers = []
         actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
         actor_layers.append(activation)
@@ -49,7 +50,7 @@ class ActorCritic(nn.Module):
                 actor_layers.append(activation)
         self.actor = nn.Sequential(*actor_layers)
 
-        # Value function
+        # Value function 构建critic网络
         critic_layers = []
         critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
         critic_layers.append(activation)
@@ -61,10 +62,11 @@ class ActorCritic(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
+        # 输出两个网络的结构
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
-        # Action noise
+        # Action noise 设置正态分布的初始标准差
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -105,16 +107,18 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
-        # compute mean
+        # compute mean actor网络推理得到正态分布均值
         mean = self.actor(observations)
-        # compute standard deviation
+        # compute standard deviation 
         if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)
+            # 复制一个维度是mean的张量，内容是std的值
+            std = self.std.expand_as(mean) 
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        # create distribution
+        # create distribution 用均值和标准差创建正态分布
+        # 创建的其实是一个批量分布，维度和mean、std相同
         self.distribution = Normal(mean, std)
 
     def act(self, observations, **kwargs):

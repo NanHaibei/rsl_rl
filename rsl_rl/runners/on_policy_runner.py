@@ -20,6 +20,7 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
+    ActorCritic_DWAQ
 )
 from rsl_rl.utils import store_code_state
 
@@ -65,7 +66,7 @@ class OnPolicyRunner:
 
         # resolve dimensions of privileged observations
         # 获取特权观测值的维度
-        if self.privileged_obs_type is not None:
+        if self.privileged_obs_type is not None: 
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
@@ -74,9 +75,24 @@ class OnPolicyRunner:
         # 从cfg中取出策略类名称，并得到类指针，默认值是ActorCritic
         policy_class = eval(self.policy_cfg.pop("class_name"))
         # 实例化策略类
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        if issubclass(policy_class, ActorCritic_DWAQ): # 如果是DWAQ算法
+            if "encoder" not in extras["observations"]:
+                raise ValueError(
+                    "Observations for the key 'encoder' not found in infos['observations']. "
+                    "Please ensure that the encoder observations are provided."
+                )
+            num_encoder_obs = extras["observations"]["encoder"].shape[1]
+            policy: ActorCritic_DWAQ = policy_class(
+                num_actor_obs=num_obs, 
+                num_encoder_obs=num_encoder_obs,
+                num_critic_obs=num_privileged_obs, 
+                num_actions=self.env.num_actions, 
+                **self.policy_cfg
+            ).to(self.device)
+        else:
+            policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+                num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
 
         # resolve dimension of rnd gated state
         # RND算法相关的内容 TODO: 看RND论文

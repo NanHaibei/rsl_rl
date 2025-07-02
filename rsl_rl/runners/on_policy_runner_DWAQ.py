@@ -40,26 +40,21 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
         self._configure_multi_gpu()
 
         # resolve training type depending on the algorithm
-        if self.alg_cfg["class_name"] == "PPO":
+        if "PPO" in self.alg_cfg["class_name"]:
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
-        # resolve dimensions of observations
         # 获取观测值
         obs, extras = self.env.get_observations()
         num_obs = obs.shape[1]
 
         if "encoder" not in extras["observations"]:
-            raise ValueError(
-                "Observations for the key 'encoder' not found in infos['observations']. "
-                "Please ensure that the encoder observations are provided."
-            )
-        num_encoder_obs = extras["observations"]["encoder"].shape[1]
+            raise ValueError("使用DWAQ时, 观测值中必须包含'encoder'")
+        
 
-        # resolve type of privileged observations
         # 设置特权观测值的获取方式
         if self.training_type == "rl":
             if "critic" in extras["observations"]:
@@ -72,15 +67,16 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
             else:
                 self.privileged_obs_type = None
 
-        # resolve dimensions of privileged observations
         # 获取特权观测值的维度
         if self.privileged_obs_type is not None: 
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
 
-        # evaluate the policy class
-        # 从cfg中取出策略类名称，并得到类指针，默认值是ActorCritic
+        # 获取编码器观测值维度
+        num_encoder_obs = extras["observations"]["encoder"].shape[1]
+
+        # 从cfg中取出策略类名称，并得到类指针，这里是ActorCritic_DWAQ
         policy_class = eval(self.policy_cfg.pop("class_name"))
         # 实例化策略类
         policy: ActorCritic_DWAQ = policy_class(
@@ -90,7 +86,7 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
             num_actions=self.env.num_actions, 
             **self.policy_cfg
         ).to(self.device)
-        # resolve dimension of rnd gated state
+
         # RND算法相关的内容 TODO: 看RND论文
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             # check if rnd gated state is present
@@ -104,15 +100,14 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
             # scale down the rnd weight with timestep (similar to how rewards are scaled down in legged_gym envs)
             self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
 
-        # if using symmetry then pass the environment config object
         # 如果使用了对称策略则传递环境类 TODO:搞懂对称策略
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # initialize algorithm
-        # 从cfg中取出算法类名称，并得到类指针，默认值是PPO
+        # 从cfg中取出算法类名称，并得到类指针，这里是PPO_DWAQ
         alg_class = eval(self.alg_cfg.pop("class_name"))
+
         # 实例化算法类
         self.alg: PPO_DWAQ = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
@@ -184,19 +179,16 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
 
-        # check if teacher is loaded
         # 如果是蒸馏训练，则检查教师模型是否加载
         if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
             raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
-        # randomize initial episode lengths (for exploration)
-        # 随机化初始的episode长度（用于探索）
+        # 随机化初始的episode长度（用于探索） TODO:学习用法
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
-        # start learning
         # 获取观测值和特权观测值
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
@@ -204,7 +196,6 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
         obs, privileged_obs, obs_history = obs.to(self.device), privileged_obs.to(self.device), obs_history.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
-        # Book keeping
         # 用于记录奖励和存活长度的缓冲区
         ep_infos = []
         rewbuffer = deque(maxlen=100)
@@ -219,7 +210,6 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Ensure all parameters are in-synced
         # 多GPU训练时同步所有GPU上的参数
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
@@ -242,7 +232,7 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # perform normalization 观测值归一化 TODO:怎么归一化
+                    # perform normalization 观测值归一化
                     obs = self.obs_normalizer(obs)
                     obs_history = self.encoder_obs_normalizer(obs_history)
                     # 如果有特权观测值，对其进行归一化
@@ -321,6 +311,6 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        # Save the final model after training 训练结束后保存权重文件
+        # 训练结束后保存权重文件
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))

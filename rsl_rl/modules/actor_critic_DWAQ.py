@@ -41,7 +41,7 @@ class ActorCritic_DWAQ(nn.Module):
         # 返回已经实例化的激活函数类
         activation = resolve_nn_activation(activation)
 
-        mlp_input_dim_a = num_actor_obs
+        mlp_input_dim_a = num_actor_obs + num_latent # actor网络输入维度是观测值和隐向量的拼接
         mlp_input_dim_c = num_critic_obs
         # Policy 构建actor网络
         actor_layers = []
@@ -64,10 +64,11 @@ class ActorCritic_DWAQ(nn.Module):
             encoder_layers.append(activation)
         self.encoder = nn.Sequential(*encoder_layers)
 
-        self.encode_mean_latent = nn.Linear(encoder_head_dims,num_latent-3) # 输出隐向量的均值
-        self.encode_logvar_latent = nn.Linear(encoder_head_dims,num_latent-3) # 输出隐向量的对数方差
-        self.encode_mean_vel = nn.Linear(encoder_head_dims,3) # 输出速度的均值
-        self.encode_logvar_vel = nn.Linear(encoder_head_dims,3) # 输出速度的对数方差
+        # TODO:是否可以只用两个头而不是四个
+        self.encode_mean_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
+        self.encode_logvar_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的对数方差
+        self.encode_mean_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
+        self.encode_logvar_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的对数方差
 
         # 构建decoder网络
         decoder_layers = []
@@ -75,7 +76,7 @@ class ActorCritic_DWAQ(nn.Module):
         decoder_layers.append(activation)
         for layer_index in range(len(decoder_hidden_dims)):
             if layer_index == len(decoder_hidden_dims) - 1:
-                decoder_layers.append(nn.Linear(decoder_hidden_dims[layer_index], num_encoder_obs)) # 最后输出下一时刻的观测值
+                decoder_layers.append(nn.Linear(decoder_hidden_dims[layer_index], num_actor_obs)) # 最后输出下一时刻的观测值
             else:
                 decoder_layers.append(nn.Linear(decoder_hidden_dims[layer_index], decoder_hidden_dims[layer_index + 1]))
                 decoder_layers.append(activation)
@@ -93,7 +94,7 @@ class ActorCritic_DWAQ(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
-        # 输出两个网络的结构
+        # 输出四个网络的结构
         print(f"Actor MLP: {self.actor}")
         print(f"Encoder MLP: {self.encoder}")
         print(f"Decoder MLP: {self.decoder}")
@@ -149,9 +150,9 @@ class ActorCritic_DWAQ(nn.Module):
         Returns:
             _type_: 隐向量
         """
-        var = torch.exp(logvar*0.5)
-        code_temp = torch.randn_like(var)
-        code = mean + var*code_temp
+        std = torch.exp(logvar*0.5) # 得到标准差
+        code_temp = torch.randn_like(std)
+        code = mean + std * code_temp
         return code
 
     def update_distribution(self, observations):

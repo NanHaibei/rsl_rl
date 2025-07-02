@@ -95,18 +95,17 @@ class PPO_DWAQ(PPO):
         else:
             self.symmetry = None
 
-        # PPO components 
-        # policy其实是ActorCritic
+
+        # policy其实是ActorCritic_DWAQ
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        # Create rollout storage
+
         # 创建经验回放池存储类
         self.storage: RolloutStorageDWAQ = None  # type: ignore
         self.transition = RolloutStorageDWAQ.TransitionDWAQ()
 
-        # PPO parameters
         # 记录PPO超参数
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
@@ -202,6 +201,7 @@ class PPO_DWAQ(PPO):
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_autoenc_loss = 0
+        mean_vel_MSE = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -272,7 +272,7 @@ class PPO_DWAQ(PPO):
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(obs_batch, obs_history_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -322,12 +322,13 @@ class PPO_DWAQ(PPO):
             # for DWAQ: Beta VAE Loss
             code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_history_batch) 
             vel_target = critic_obs_batch[:,3:6]
-            decode_target = obs_batch # TODO: 检查obs_batch的shape
+            decode_target = next_obs_batch # TODO: 检查obs_batch的shape
             vel_target.requires_grad = False
             decode_target.requires_grad = False
             # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
             # TODO:处理next obs batch
-            autoenc_loss = (nn.MSELoss()(code_vel,vel_target) + nn.MSELoss()(decode,next_obs_batch) + self.beta*(-0.5 * torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())))/self.num_mini_batches
+            vel_MSE = nn.MSELoss()(code_vel, vel_target)
+            autoenc_loss = (vel_MSE + nn.MSELoss()(decode,next_obs_batch) + self.beta*(-0.5 * torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())))/self.num_mini_batches
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -420,6 +421,7 @@ class PPO_DWAQ(PPO):
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             mean_autoenc_loss += autoenc_loss.item()
+            mean_vel_MSE += vel_MSE.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -433,6 +435,7 @@ class PPO_DWAQ(PPO):
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_autoenc_loss /= num_updates
+        mean_vel_MSE /= num_updates
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -448,6 +451,7 @@ class PPO_DWAQ(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "autoenc": mean_autoenc_loss,
+            "vel_MSE": mean_vel_MSE,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

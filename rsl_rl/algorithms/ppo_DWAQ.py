@@ -202,6 +202,8 @@ class PPO_DWAQ(PPO):
         mean_entropy = 0
         mean_autoenc_loss = 0
         mean_vel_MSE = 0
+        mean_OBS_MSE = 0
+        mean_DKL_loss = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -321,14 +323,17 @@ class PPO_DWAQ(PPO):
 
             # for DWAQ: Beta VAE Loss
             code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_history_batch) 
-            vel_target = critic_obs_batch[:,3:6]
+            vel_target = critic_obs_batch[:,0:3]
             decode_target = next_obs_batch # TODO: 检查obs_batch的shape
             vel_target.requires_grad = False
             decode_target.requires_grad = False
             # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
             # TODO:处理next obs batch
             vel_MSE = nn.MSELoss()(code_vel, vel_target)
-            autoenc_loss = (vel_MSE + nn.MSELoss()(decode,next_obs_batch) + self.beta*(-0.5 * torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())))/self.num_mini_batches
+            obs_MSE = nn.MSELoss()(decode, decode_target)
+            dkl_loss = -0.5 * torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())
+            autoenc_loss = (vel_MSE + obs_MSE + self.beta*dkl_loss)/self.num_mini_batches
+            # autoenc_loss = (vel_MSE + obs_MSE)/self.num_mini_batches
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -422,6 +427,8 @@ class PPO_DWAQ(PPO):
             mean_entropy += entropy_batch.mean().item()
             mean_autoenc_loss += autoenc_loss.item()
             mean_vel_MSE += vel_MSE.item()
+            mean_OBS_MSE += obs_MSE.item()
+            mean_DKL_loss += dkl_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -436,6 +443,8 @@ class PPO_DWAQ(PPO):
         mean_entropy /= num_updates
         mean_autoenc_loss /= num_updates
         mean_vel_MSE /= num_updates
+        mean_OBS_MSE /= num_updates
+        mean_DKL_loss /= num_updates
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -452,6 +461,8 @@ class PPO_DWAQ(PPO):
             "entropy": mean_entropy,
             "autoenc": mean_autoenc_loss,
             "vel_MSE": mean_vel_MSE,
+            "OBS_MSE": mean_OBS_MSE,
+            "DKL_loss": mean_DKL_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

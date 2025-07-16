@@ -23,7 +23,6 @@ class ActorCritic_DWAQ(nn.Module):
         num_actions,
         num_latent = 32,
         encoder_hidden_dims=[256, 256],
-        encoder_head_dims = 64,
         decoder_hidden_dims=[256, 256, 256],
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
@@ -183,7 +182,7 @@ class ActorCritic_DWAQ(nn.Module):
         mean_latent = self.encode_mean_latent(x) # 得到隐向量的均值
         logvar_latent = self.encode_logvar_latent(x) # 得到隐向量的对数方差
         mean_vel = self.encode_mean_vel(x) # 得到速度的均值
-        logvar_vel = self.encode_mean_vel(x) # 得到速度的对数方差
+        logvar_vel = self.encode_logvar_vel(x) # 得到速度的对数方差
 
         code_latent = self.reparameterise(mean_latent,logvar_latent)
         code_vel = self.reparameterise(mean_vel,logvar_vel)

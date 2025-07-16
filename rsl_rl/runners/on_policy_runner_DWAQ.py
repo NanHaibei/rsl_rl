@@ -227,11 +227,13 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                 # 一个学习迭代包含多个环境步数
                 for _ in range(self.num_steps_per_env):
                     # Sample actions 网络输出动作值
-                    actions = self.alg.act(obs, privileged_obs, obs_history, obs) # TODO: 加入next_obs
+                    actions = self.alg.act(obs, privileged_obs, obs_history, obs)
                     # Step the environment 环境根据动作值输出五元组
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # 保存下一次的观测值
+                    self.alg.transition.next_obs = obs
                     # perform normalization 观测值归一化
                     obs = self.obs_normalizer(obs)
                     obs_history = self.encoder_obs_normalizer(obs_history)
@@ -314,3 +316,40 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
         # 训练结束后保存权重文件
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def get_inference_policy(self, device=None):
+        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        if device is not None:
+            self.alg.policy.to(device)
+        policy = self.alg.policy.act_inference
+        if self.cfg["empirical_normalization"]:
+            if device is not None:
+                self.obs_normalizer.to(device)
+                self.encoder_obs_normalizer.to(device)
+            policy = lambda x,x_history: self.alg.policy.act_inference(self.obs_normalizer(x), self.encoder_obs_normalizer(x_history))  # noqa: E731
+        return policy
+    
+    def save(self, path: str, infos=None):
+        # -- Save model
+        saved_dict = {
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        # -- Save RND model if used
+        if self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        # -- Save observation normalizer if used
+        if self.empirical_normalization:
+            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
+            saved_dict["encoder_obs_norm_state_dict"] = self.encoder_obs_normalizer.state_dict()
+            saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
+
+        # save model
+        torch.save(saved_dict, path)
+
+        # upload model to external logging service
+        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+            self.writer.save_model(path, self.current_learning_iteration)

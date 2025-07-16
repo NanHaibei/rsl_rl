@@ -329,11 +329,17 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
             policy = lambda x,x_history: self.alg.policy.act_inference(self.obs_normalizer(x), self.encoder_obs_normalizer(x_history))  # noqa: E731
         return policy
     
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        super().log(locs, width, pad)
+        # 记录vae优化器的学习率
+        self.writer.add_scalar("Loss/vae_learning_rate", self.alg.vae_optimizer.param_groups[0]['lr'], locs["it"])
+    
     def save(self, path: str, infos=None):
         # -- Save model
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "ac_optimizer_state_dict": self.alg.ac_optimizer.state_dict(),
+            "vae_optimizer_state_dict": self.alg.vae_optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }

@@ -198,7 +198,7 @@ class ActorCritic_DWAQ(nn.Module):
             obs_history (_type_): 观测值历史
         """
         code,_,_,_,_,_,_ = self.cenet_forward(obs_history)
-        observations = torch.cat((code,observations),dim=-1) # 隐向量放在当前观测值前面
+        observations = torch.cat((code.detach(),observations),dim=-1) # 隐向量放在当前观测值前面
         self.update_distribution(observations)
         return self.distribution.sample()
 
@@ -218,7 +218,7 @@ class ActorCritic_DWAQ(nn.Module):
             obs_history (_type_): _description_
         """
         code,_,_,_,_,_,_ = self.cenet_forward(obs_history)
-        observations = torch.cat((code,observations),dim=-1)
+        observations = torch.cat((code.detach(),observations),dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean
 

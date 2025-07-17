@@ -230,6 +230,7 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                     actions = self.alg.act(obs, privileged_obs, obs_history, obs)
                     # Step the environment 环境根据动作值输出五元组
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs_history = infos['observations']['encoder'].to(self.device)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # 保存下一次的观测值

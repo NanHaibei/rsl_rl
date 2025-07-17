@@ -352,13 +352,53 @@ class PPO_DWAQ(PPO):
             obs_MSE = nn.MSELoss()(decode, decode_target)
             # KL散度损失：按批次平均
             dkl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(), dim=1))
+            
+            # # 对各损失进行限幅，防止梯度爆炸
+            # vel_MSE = torch.clamp(vel_MSE, max=1e3)
+            # obs_MSE = torch.clamp(obs_MSE, max=1e3)
+            # dkl_loss = torch.clamp(dkl_loss, min=-1e3, max=1e3)
+            
+            # # 检查损失是否异常
+            # if torch.isnan(vel_MSE) or torch.isinf(vel_MSE):
+            #     print(f"Warning: vel_MSE is {vel_MSE}, setting to 0")
+            #     vel_MSE = torch.tensor(0.0, device=vel_MSE.device)
+            # if torch.isnan(obs_MSE) or torch.isinf(obs_MSE):
+            #     print(f"Warning: obs_MSE is {obs_MSE}, setting to 0")
+            #     obs_MSE = torch.tensor(0.0, device=obs_MSE.device)
+            # if torch.isnan(dkl_loss) or torch.isinf(dkl_loss):
+            #     print(f"Warning: dkl_loss is {dkl_loss}, setting to 0")
+            #     dkl_loss = torch.tensor(0.0, device=dkl_loss.device)
+                
             autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
+            
+            # 对总VAE损失进行限幅
+            # autoenc_loss = torch.clamp(autoenc_loss, max=5e3)
+            
+            # 检查总损失是否异常
+            # if torch.isnan(autoenc_loss) or torch.isinf(autoenc_loss):
+            #     print(f"Warning: autoenc_loss is {autoenc_loss}, skipping this update")
+            #     continue  # 跳过这个批次的更新
+                
             self.vae_optimizer.zero_grad()
             autoenc_loss.backward(retain_graph=True)
-            nn.utils.clip_grad_norm_(
-                [p for group in self.vae_optimizer.param_groups for p in group['params']], 
-                self.max_grad_norm
-            )
+            
+            # 检查梯度并进行更保守的裁剪
+            vae_params = [p for group in self.vae_optimizer.param_groups for p in group['params']]
+            grad_norm = nn.utils.clip_grad_norm_(vae_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
+            
+            # 如果梯度过大，进一步降低学习率或跳过更新
+            # if grad_norm > self.max_grad_norm * 2:
+            #     print(f"Warning: VAE grad_norm too large ({grad_norm:.2f}), skipping update")
+            #     self.vae_optimizer.zero_grad()
+            # else:
+            #     self.vae_optimizer.step()
+            # vae_params = [self.policy.encoder.parameters(),
+            #               self.policy.encode_mean_latent.parameters(),
+            #               self.policy.encode_logvar_latent.parameters(),
+            #               self.policy.encode_mean_vel.parameters(),
+            #               self.policy.encode_logvar_vel.parameters(),
+            #               self.policy.decoder.parameters()]
+            # nn.utils.clip_grad_norm_(vae_params, self.max_grad_norm)
             self.vae_optimizer.step()
 
             # Surrogate loss

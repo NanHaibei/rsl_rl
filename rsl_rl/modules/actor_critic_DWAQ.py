@@ -33,7 +33,7 @@ class ActorCritic_DWAQ(nn.Module):
     ):
         if kwargs:
             print(
-                "ActorCritic.__init__ got unexpected arguments, which will be ignored: "
+                "ActorCritic_DWAQ.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()

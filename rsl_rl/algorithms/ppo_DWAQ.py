@@ -338,8 +338,8 @@ class PPO_DWAQ(PPO):
                     #     param_group["lr"] = self.learning_rate
                     for param_group in self.ac_optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
-                    for param_group in self.vae_optimizer.param_groups:
-                        param_group["lr"]  = max(min(self.learning_rate * 5, 1e-3), 5e-5)
+                    # for param_group in self.vae_optimizer.param_groups:
+                    #     param_group["lr"]  = max(min(self.learning_rate * 5, 1e-3), 5e-5)
 
             # for DWAQ: Beta VAE Loss
             code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_history_batch) 

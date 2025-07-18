@@ -329,6 +329,38 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                 self.encoder_obs_normalizer.to(device)
             policy = lambda x,x_history: self.alg.policy.act_inference(self.obs_normalizer(x), self.encoder_obs_normalizer(x_history))  # noqa: E731
         return policy
+
+    def load(self, path: str, load_optimizer: bool = True):
+        loaded_dict = torch.load(path, weights_only=False)
+        # -- Load model
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        # -- Load RND model if used
+        if self.alg.rnd:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- Load observation normalizer if used
+        if self.empirical_normalization:
+            if resumed_training:
+                # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
+                # and the critic/teacher normalizer is loaded for the critic/teacher
+                self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+            else:
+                # if the training is not resumed but a model is loaded, this run must be distillation training following
+                # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
+                # is not loaded, as the observation space could differ from the previous rl training.
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+        # -- load optimizer if used
+        if load_optimizer and resumed_training:
+            # -- algorithm optimizer
+            self.alg.ac_optimizer.load_state_dict(loaded_dict["ac_optimizer_state_dict"])
+            self.alg.vae_optimizer.load_state_dict(loaded_dict["vae_optimizer_state_dict"])
+            # -- RND optimizer if used
+            if self.alg.rnd:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        # -- load current learning iteration
+        if resumed_training:
+            self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict["infos"]
     
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         super().log(locs, width, pad)

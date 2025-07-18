@@ -217,7 +217,12 @@ class ActorCritic_DWAQ(nn.Module):
             observations (_type_): _description_
             obs_history (_type_): _description_
         """
+
         code,_,_,_,_,_,_ = self.cenet_forward(obs_history)
+        # x = self.encoder(obs_history)
+        # mean_vel = self.encode_mean_vel(x)
+        # mean_latent = self.encode_mean_latent(x)
+        # code = torch.cat((mean_vel,mean_latent),dim=-1)
         observations = torch.cat((code.detach(),observations),dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean

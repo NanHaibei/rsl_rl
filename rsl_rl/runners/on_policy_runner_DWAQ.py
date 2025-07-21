@@ -172,12 +172,17 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
 
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+            elif self.logger_type == "swanlab":
+                from rsl_rl.utils.swanlab_utils import SwanLabSummaryWriter
+
+                self.writer = SwanLabSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
 
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
-                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb', 'swanlab' or 'tensorboard'.")
 
         # 如果是蒸馏训练，则检查教师模型是否加载
         if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
@@ -310,7 +315,7 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                 # obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
                 # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                if self.logger_type in ["wandb", "neptune", "swanlab"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
@@ -343,6 +348,7 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
                 # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
                 # and the critic/teacher normalizer is loaded for the critic/teacher
                 self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                self.encoder_obs_normalizer.load_state_dict(loaded_dict["encoder_obs_norm_state_dict"])
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
             else:
                 # if the training is not resumed but a model is loaded, this run must be distillation training following
@@ -390,5 +396,5 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
         torch.save(saved_dict, path)
 
         # upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+        if self.logger_type in ["neptune", "wandb", "swanlab"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)

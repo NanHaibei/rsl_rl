@@ -36,6 +36,8 @@ class OnPolicyRunnerDWAQ(OnPolicyRunner):
         self.device = device
         self.env = env
 
+
+
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
 

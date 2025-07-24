@@ -11,10 +11,11 @@ from rsl_rl.utils import split_and_pad_trajectories
 from rsl_rl.storage.rollout_storage import RolloutStorage
 
 
-class RolloutStorageDWAQ(RolloutStorage):
-    class TransitionDWAQ:
+class RolloutStorageNextObs(RolloutStorage):
+    class TransitionNextObs:
         def __init__(self):
             self.observations = None
+            self.next_observations = None
             self.privileged_observations = None
             self.actions = None
             self.privileged_actions = None
@@ -25,8 +26,6 @@ class RolloutStorageDWAQ(RolloutStorage):
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
-            self.obs_history = None
-            self.next_obs = None
             self.rnd_state = None
 
         def clear(self):
@@ -40,7 +39,6 @@ class RolloutStorageDWAQ(RolloutStorage):
         obs_shape,
         privileged_obs_shape,
         actions_shape,
-        obs_history_shape,
         rnd_state_shape=None,
         device="cpu",
     ):
@@ -53,7 +51,6 @@ class RolloutStorageDWAQ(RolloutStorage):
         self.privileged_obs_shape = privileged_obs_shape
         self.rnd_state_shape = rnd_state_shape
         self.actions_shape = actions_shape
-        self.obs_history_shape = obs_history_shape
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
@@ -67,9 +64,8 @@ class RolloutStorageDWAQ(RolloutStorage):
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
-        # for DWAQ
-        self.obs_history = torch.zeros(num_transitions_per_env, num_envs, *obs_history_shape, device=self.device)
-        self.next_obs = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        # next obs
+        self.next_observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
 
         # for distillation
         if training_type == "distillation":
@@ -95,7 +91,7 @@ class RolloutStorageDWAQ(RolloutStorage):
         # counter for the number of transitions stored
         self.step = 0
 
-    def add_transitions(self, transition: TransitionDWAQ):
+    def add_transitions(self, transition: TransitionNextObs):
         # check if the transition is valid
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
@@ -108,9 +104,8 @@ class RolloutStorageDWAQ(RolloutStorage):
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
-        # for DWAQ
-        self.obs_history[self.step].copy_(transition.obs_history)
-        self.next_obs[self.step].copy_(transition.next_obs)
+        # next obs
+        self.next_observations[self.step].copy_(transition.next_observations)
 
         # for distillation
         if self.training_type == "distillation":
@@ -152,9 +147,8 @@ class RolloutStorageDWAQ(RolloutStorage):
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
 
-        # for DWAQ
-        obs_history = self.obs_history.flatten(0, 1)
-        next_obs = self.next_obs.flatten(0, 1)
+        # next obs
+        next_observations = self.next_observations.flatten(0, 1)
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -179,9 +173,8 @@ class RolloutStorageDWAQ(RolloutStorage):
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
 
-                # -- For DWAQ
-                obs_history_batch = obs_history[batch_idx]
-                next_obs_batch = next_obs[batch_idx]
+                # -- next obs
+                next_observations_batch = next_observations[batch_idx]
 
                 # -- For PPO
                 target_values_batch = values[batch_idx]
@@ -201,4 +194,4 @@ class RolloutStorageDWAQ(RolloutStorage):
                 yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch, obs_history_batch, next_obs_batch
+                ), None, rnd_state_batch, next_observations_batch

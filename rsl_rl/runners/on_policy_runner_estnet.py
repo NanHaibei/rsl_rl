@@ -12,12 +12,12 @@ import torch
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, Distillation
+from rsl_rl.algorithms import PPO, PPO_EstNet, Distillation
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
-    ActorCriticRecurrent,
     ActorCritic_EstNet,
+    ActorCriticRecurrent,
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
@@ -46,7 +46,6 @@ class OnPolicyRunner:
             self.training_type = "distillation"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
-            
 
         # resolve dimensions of observations
         # 获取观测值
@@ -77,7 +76,7 @@ class OnPolicyRunner:
         # 从cfg中取出策略类名称，并得到类指针，默认值是ActorCritic
         policy_class = eval(self.policy_cfg.pop("class_name"))
         # 实例化策略类
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | ActorCritic_EstNet = policy_class(
+        policy: ActorCritic_EstNet = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
@@ -105,7 +104,7 @@ class OnPolicyRunner:
         # 从cfg中取出算法类名称，并得到类指针，默认值是PPO
         alg_class = eval(self.alg_cfg.pop("class_name"))
         # 实例化算法类
-        self.alg: PPO | Distillation = alg_class(
+        self.alg: PPO_EstNet = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

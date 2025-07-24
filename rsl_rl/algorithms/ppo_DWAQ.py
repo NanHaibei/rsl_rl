@@ -12,7 +12,7 @@ from itertools import chain
 
 from rsl_rl.modules import ActorCritic_DWAQ
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorageDWAQ
+from rsl_rl.storage import RolloutStorageNextObs
 from rsl_rl.utils import string_to_callable
 from rsl_rl.algorithms.ppo import PPO
 
@@ -119,8 +119,8 @@ class PPO_DWAQ(PPO):
         ], lr=learning_rate)
 
         # 创建经验回放池存储类
-        self.storage: RolloutStorageDWAQ = None  # type: ignore
-        self.transition = RolloutStorageDWAQ.TransitionDWAQ()
+        self.storage: RolloutStorageNextObs = None  # type: ignore
+        self.transition = RolloutStorageNextObs.TransitionDWAQ()
 
         # 记录PPO超参数
         self.clip_param = clip_param
@@ -153,7 +153,7 @@ class PPO_DWAQ(PPO):
         else:
             rnd_state_shape = None
         # create rollout storage
-        self.storage = RolloutStorageDWAQ(
+        self.storage = RolloutStorageNextObs(
             training_type,
             num_envs,
             num_transitions_per_env,

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import ActorCritic, ActorCritic_EstNet
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,7 +19,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic
+    policy: ActorCritic | ActorCritic_EstNet 
     """The actor critic module."""
 
     def __init__(
@@ -56,6 +56,7 @@ class PPO:
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+
 
         # RND components
         if rnd_cfg is not None:
@@ -101,6 +102,12 @@ class PPO:
         # 创建经验回放池存储类
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
+
+        # 如果使用了EstmateNet
+        if isinstance(self.policy, ActorCritic_EstNet):
+            self.estnet = True
+        else:
+            self.estnet = False
 
         # PPO parameters
         # 记录PPO超参数
@@ -202,6 +209,11 @@ class PPO:
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
+        # -- vel est loss
+        if self.estnet:
+            mean_vel_loss = 0
+        else:
+            mean_vel_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -307,6 +319,13 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
+            # Estimate Net 速度估计损失
+            if self.estnet:
+                _,vel_est = self.policy.estnet_forward(obs_batch) 
+                vel_target = critic_obs_batch[:,0:3]
+                vel_target.requires_grad = False
+                vel_MSE = nn.MSELoss()(vel_est, vel_target)
+
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -326,7 +345,10 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            if self.estnet:
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + vel_MSE
+            else:
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -403,6 +425,9 @@ class PPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # -- vel est loss
+            if mean_vel_loss is not None:
+                mean_vel_loss += vel_MSE.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -415,6 +440,9 @@ class PPO:
         # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        # -- For vel est
+        if mean_vel_loss is not None:
+            mean_vel_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -428,6 +456,8 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.estnet:
+            loss_dict["vel_loss"] = mean_vel_loss
 
         return loss_dict
 

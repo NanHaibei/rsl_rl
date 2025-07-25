@@ -15,7 +15,6 @@ class RolloutStorageNextObs(RolloutStorage):
     class TransitionNextObs:
         def __init__(self):
             self.observations = None
-            self.next_observations = None
             self.privileged_observations = None
             self.actions = None
             self.privileged_actions = None
@@ -27,6 +26,7 @@ class RolloutStorageNextObs(RolloutStorage):
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
+            self.next_observations = None
 
         def clear(self):
             self.__init__()

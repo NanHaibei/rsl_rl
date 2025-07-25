@@ -73,6 +73,7 @@ class ActorCritic_EstNet(ActorCritic):
         self.encode_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
 
         # 输出网络结构
+        print(f"Actor MLP: {self.actor}")
         print(f"Encoder MLP: {self.encoder}")
 
 
@@ -89,30 +90,30 @@ class ActorCritic_EstNet(ActorCritic):
         code = torch.cat((est_vel,latent),dim=-1)
         return code,est_vel
 
-    def act(self, observations, **kwargs):
+    def act(self, obs_history, **kwargs):
         """训练时使用的前向推理函数,action经过正态分布采样再输出
 
         Args:
-            observations (_type_): 当前观测值
+            obs_history (_type_): 当前观测值
             obs_history (_type_): 观测值历史
         """
-        code,_ = self.estnet_forward(observations)
-        now_obs = observations[:, -self.one_obs_len:]
+        code,_ = self.estnet_forward(obs_history)
+        now_obs = obs_history[:, -self.one_obs_len:]
         observations = torch.cat((code.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前面
         self.update_distribution(observations)
         return self.distribution.sample()
 
 
-    def act_inference(self, observations):
+    def act_inference(self, obs_history):
         """部署时使用的前向推理函数
 
         Args:
-            observations (_type_): _description_
+            obs_history (_type_): _description_
             obs_history (_type_): _description_
         """
 
-        code,_ = self.estnet_forward(observations)
-        now_obs = observations[:, -self.one_obs_len:]
+        code,_ = self.estnet_forward(obs_history)
+        now_obs = obs_history[:, -self.one_obs_len:]
         observations = torch.cat((code.detach(),now_obs),dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean

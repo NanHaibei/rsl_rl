@@ -151,3 +151,6 @@ class ActorCritic(nn.Module):
 
         super().load_state_dict(state_dict, strict=strict)
         return True
+    
+    def _init_nn(self):
+        super().__init__()

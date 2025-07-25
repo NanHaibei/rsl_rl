@@ -10,15 +10,14 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 from rsl_rl.utils import resolve_nn_activation
+from .actor_critic import ActorCritic
 
-
-class ActorCritic_DWAQ(nn.Module):
+class ActorCritic_DWAQ(ActorCritic):
     is_recurrent = False
 
     def __init__(
         self,
         num_actor_obs,
-        num_encoder_obs,
         num_critic_obs,
         num_actions,
         num_latent = 32,
@@ -29,18 +28,17 @@ class ActorCritic_DWAQ(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
+        num_history_len = 5,
         **kwargs,
     ):
-        if kwargs:
-            print(
-                "ActorCritic_DWAQ.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs.keys()])
-            )
-        super().__init__()
+        super()._init_nn()
         # 返回已经实例化的激活函数类
         activation = resolve_nn_activation(activation)
 
-        mlp_input_dim_a = num_actor_obs + num_latent # actor网络输入维度是观测值和隐向量的拼接
+        # 获取一帧obs的长度
+        self.one_obs_len: int = int(num_actor_obs / num_history_len)
+
+        mlp_input_dim_a = self.one_obs_len + num_latent # actor网络输入维度是观测值和隐向量的拼接
         mlp_input_dim_c = num_critic_obs
         # Policy 构建actor网络
         actor_layers = []
@@ -56,7 +54,7 @@ class ActorCritic_DWAQ(nn.Module):
 
         # 构建encoder网络
         encoder_layers = []
-        encoder_layers.append(nn.Linear(num_encoder_obs, encoder_hidden_dims[0]))
+        encoder_layers.append(nn.Linear(num_actor_obs, encoder_hidden_dims[0]))
         encoder_layers.append(activation)
         for layer_index in range(len(encoder_hidden_dims) - 1):
             encoder_layers.append(nn.Linear(encoder_hidden_dims[layer_index], encoder_hidden_dims[layer_index + 1]))
@@ -112,32 +110,6 @@ class ActorCritic_DWAQ(nn.Module):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
-
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales):
-        [
-            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
-            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
-        ]
-
-    def reset(self, dones=None):
-        pass
-
-    def forward(self):
-        raise NotImplementedError
-
-    @property
-    def action_mean(self):
-        return self.distribution.mean
-
-    @property
-    def action_std(self):
-        return self.distribution.stddev
-
-    @property
-    def entropy(self):
-        return self.distribution.entropy().sum(dim=-1)
     
     def reparameterise(self,mean,logvar):
         """重参数化
@@ -153,21 +125,6 @@ class ActorCritic_DWAQ(nn.Module):
         code_temp = torch.randn_like(std)
         code = mean + std * code_temp
         return code
-
-    def update_distribution(self, observations):
-        # compute mean actor网络推理得到正态分布均值
-        mean = self.actor(observations)
-        # compute standard deviation 
-        if self.noise_std_type == "scalar":
-            # 复制一个维度是mean的张量，内容是std的值
-            std = self.std.expand_as(mean) 
-        elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        # create distribution 用均值和标准差创建正态分布
-        # 创建的其实是一个批量分布，维度和mean、std相同
-        self.distribution = Normal(mean, std)
 
     def cenet_forward(self,obs_history):
         """CENet 前向推理
@@ -192,7 +149,7 @@ class ActorCritic_DWAQ(nn.Module):
         decode = self.decoder(code)
         return code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent
 
-    def act(self, observations, obs_history, **kwargs):
+    def act(self, obs_history, **kwargs):
         """训练时使用的前向推理函数,policy输出经过正态分布再
 
         Args:
@@ -200,19 +157,14 @@ class ActorCritic_DWAQ(nn.Module):
             obs_history (_type_): 观测值历史
         """
         code,_,_,_,_,_,_ = self.cenet_forward(obs_history)
-        observations = torch.cat((code.detach(),observations),dim=-1) # 隐向量放在当前观测值前面
+        now_obs = obs_history[:, -self.one_obs_len:]
+        observations = torch.cat((code.detach(), now_obs),dim=-1) # 隐向量放在当前观测值前面
         self.update_distribution(observations)
         return self.distribution.sample()
 
-    def get_actions_log_prob(self, actions):
-        """计算动作值的概率分布
 
-        Args:
-            actions (_type_): 动作值
-        """
-        return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, obs_history):
+    def act_inference(self, obs_history):
         """部署时使用的前向推理函数
 
         Args:
@@ -220,36 +172,11 @@ class ActorCritic_DWAQ(nn.Module):
             obs_history (_type_): _description_
         """
 
-        # code,_,_,_,_,_,_ = self.cenet_forward(obs_history) # play的时候用这个还是会nan
         x = self.encoder(obs_history)
         mean_vel = self.encode_mean_vel(x)
         mean_latent = self.encode_mean_latent(x)
         code = torch.cat((mean_vel,mean_latent),dim=-1)
-        observations = torch.cat((code.detach(),observations),dim=-1)
+        now_obs = obs_history[:, -self.one_obs_len:]
+        observations = torch.cat((code.detach(), now_obs),dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean
-
-    def evaluate(self, critic_observations, **kwargs):
-        """critic网络输出值函数
-
-        Args:
-            critic_observations (_type_): critic的观测值
-        """
-        value = self.critic(critic_observations)
-        return value
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Load the parameters of the actor-critic model.
-
-        Args:
-            state_dict (dict): State dictionary of the model.
-            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
-                           module's state_dict() function.
-
-        Returns:
-            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
-                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
-        """
-
-        super().load_state_dict(state_dict, strict=strict)
-        return True

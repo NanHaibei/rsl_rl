@@ -101,26 +101,26 @@ class PPO_DWAQ(PPO):
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
-        # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
-        self.vae_optimizer = torch.optim.Adam([
-            {'params': self.policy.encoder.parameters()},
-            {'params': self.policy.encode_mean_latent.parameters()},
-            {'params': self.policy.encode_logvar_latent.parameters()},
-            {'params': self.policy.encode_mean_vel.parameters()},
-            {'params': self.policy.encode_logvar_vel.parameters()},
-            {'params': self.policy.decoder.parameters()},
-        ], lr=vae_learning_rate)
+        # self.vae_optimizer = torch.optim.Adam([
+        #     {'params': self.policy.encoder.parameters()},
+        #     {'params': self.policy.encode_mean_latent.parameters()},
+        #     {'params': self.policy.encode_logvar_latent.parameters()},
+        #     {'params': self.policy.encode_mean_vel.parameters()},
+        #     {'params': self.policy.encode_logvar_vel.parameters()},
+        #     {'params': self.policy.decoder.parameters()},
+        # ], lr=vae_learning_rate)
 
-        self.ac_optimizer = torch.optim.Adam([
-            {'params': self.policy.actor.parameters()},
-            {'params': self.policy.critic.parameters()},
-            {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-        ], lr=learning_rate)
+        # self.ac_optimizer = torch.optim.Adam([
+        #     {'params': self.policy.actor.parameters()},
+        #     {'params': self.policy.critic.parameters()},
+        #     {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+        # ], lr=learning_rate)
 
         # 创建经验回放池存储类
         self.storage: RolloutStorageNextObs = None  # type: ignore
-        self.transition = RolloutStorageNextObs.TransitionDWAQ()
+        self.transition = RolloutStorageNextObs.TransitionNextObs()
 
         # 记录PPO超参数
         self.clip_param = clip_param
@@ -145,7 +145,6 @@ class PPO_DWAQ(PPO):
         actor_obs_shape, 
         critic_obs_shape, 
         actions_shape,
-        actor_obs_history_shape,
     ):
         # create memory for RND as well :)
         if self.rnd:
@@ -160,56 +159,23 @@ class PPO_DWAQ(PPO):
             actor_obs_shape,
             critic_obs_shape,
             actions_shape,
-            actor_obs_history_shape,
             rnd_state_shape,
             self.device,
         )
 
-    def act(self, obs, critic_obs, obs_history, next_obs):
+    def act(self, obs, critic_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs,obs_history).detach()
+        self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
-        # for DWAQ
-        self.transition.obs_history = obs_history.detach()
-        self.transition.next_obs = next_obs.detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
         return self.transition.actions
-
-    def process_env_step(self, rewards, dones, infos):
-        # Record the rewards and dones TODO:搞懂done是什么
-        # Note: we clone here because later on we bootstrap the rewards based on timeouts
-        self.transition.rewards = rewards.clone()
-        self.transition.dones = dones
-
-        # Compute the intrinsic rewards and add to extrinsic rewards
-        if self.rnd:
-            # Obtain curiosity gates / observations from infos
-            rnd_state = infos["observations"]["rnd_state"]
-            # Compute the intrinsic rewards
-            # note: rnd_state is the gated_state after normalization if normalization is used
-            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # Add intrinsic rewards to extrinsic rewards
-            self.transition.rewards += self.intrinsic_rewards
-            # Record the curiosity gates
-            self.transition.rnd_state = rnd_state.clone()
-
-        # Bootstrapping on time outs
-        if "time_outs" in infos:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
-            )
-
-        # record the transition
-        self.storage.add_transitions(self.transition)
-        self.transition.clear()
-        self.policy.reset(dones)
 
 
     def update(self):  # noqa: C901
@@ -251,8 +217,7 @@ class PPO_DWAQ(PPO):
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
-            obs_history_batch,
-            next_obs_batch
+            next_observations_batch
         ) in generator:
 
             # number of augmentations per sample
@@ -290,7 +255,7 @@ class PPO_DWAQ(PPO):
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, obs_history_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -334,17 +299,17 @@ class PPO_DWAQ(PPO):
                         self.learning_rate = lr_tensor.item()
 
                     # Update the learning rate for all parameter groups
-                    # for param_group in self.optimizer.param_groups:
-                    #     param_group["lr"] = self.learning_rate
-                    for param_group in self.ac_optimizer.param_groups:
+                    for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
-                    for param_group in self.vae_optimizer.param_groups:
-                        param_group["lr"]  = max(min(self.learning_rate * 5, 1e-3), 5e-5)
+                    # for param_group in self.ac_optimizer.param_groups:
+                    #     param_group["lr"] = self.learning_rate
+                    # for param_group in self.vae_optimizer.param_groups:
+                    #     param_group["lr"]  = max(min(self.learning_rate * 5, 1e-3), 5e-5)
 
             # for DWAQ: Beta VAE Loss
-            code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_history_batch) 
+            code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_batch) 
             vel_target = critic_obs_batch[:,0:3]
-            decode_target = next_obs_batch 
+            decode_target = next_observations_batch
             vel_target.requires_grad = False
             decode_target.requires_grad = False
             # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
@@ -354,13 +319,13 @@ class PPO_DWAQ(PPO):
             dkl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(), dim=1))
             autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
             
-            self.vae_optimizer.zero_grad()
-            autoenc_loss.backward(retain_graph=True)
+            # self.vae_optimizer.zero_grad()
+            # autoenc_loss.backward(retain_graph=True)
             
             # 检查梯度并进行更保守的裁剪
-            vae_params = [p for group in self.vae_optimizer.param_groups for p in group['params']]
-            grad_norm = nn.utils.clip_grad_norm_(vae_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
-            self.vae_optimizer.step()
+            # vae_params = [p for group in self.vae_optimizer.param_groups for p in group['params']]
+            # grad_norm = nn.utils.clip_grad_norm_(vae_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
+            # self.vae_optimizer.step()
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -381,7 +346,7 @@ class PPO_DWAQ(PPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + autoenc_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -431,7 +396,7 @@ class PPO_DWAQ(PPO):
             # -- For PPO
             # self.optimizer.zero_grad()
             # loss.backward()
-            self.ac_optimizer.zero_grad()
+            self.optimizer.zero_grad()
             loss.backward()
             
             # -- For RND
@@ -448,10 +413,10 @@ class PPO_DWAQ(PPO):
             # nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             # self.optimizer.step()
             nn.utils.clip_grad_norm_(
-                [p for group in self.ac_optimizer.param_groups for p in group['params']], 
+                [p for group in self.optimizer.param_groups for p in group['params']], 
                 self.max_grad_norm
             )
-            self.ac_optimizer.step() 
+            self.optimizer.step() 
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()

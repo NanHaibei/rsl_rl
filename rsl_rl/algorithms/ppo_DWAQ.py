@@ -460,8 +460,8 @@ class PPO_DWAQ(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "autoenc": mean_autoenc_loss,
-            "vel_MSE": mean_vel_MSE,
-            "OBS_MSE": mean_OBS_MSE,
+            "vel_loss": mean_vel_MSE,
+            "obs_loss": mean_OBS_MSE,
             "DKL_loss": mean_DKL_loss,
         }
         if self.rnd:

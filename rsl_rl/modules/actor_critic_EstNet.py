@@ -50,6 +50,7 @@ class ActorCritic_EstNet(ActorCritic):
 
         # Policy 构建actor网络
         actor_layers = []
+        # actor_layers.append(nn.Linear(self.one_obs_len, actor_hidden_dims[0]))
         actor_layers.append(nn.Linear(self.one_obs_len + num_latent, actor_hidden_dims[0]))
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
@@ -69,7 +70,7 @@ class ActorCritic_EstNet(ActorCritic):
             encoder_layers.append(activation)
         self.encoder = nn.Sequential(*encoder_layers)
 
-        self.encode_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
+        # self.encode_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
         self.encode_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
 
         # 输出网络结构
@@ -84,10 +85,11 @@ class ActorCritic_EstNet(ActorCritic):
 
         """
         x = self.encoder(obs_history)
-        latent = self.encode_latent(x) # 得到隐向量
+        # latent = self.encode_latent(x) # 得到隐向量
         est_vel = self.encode_vel(x) # 得到速度估计值
 
-        code = torch.cat((est_vel,latent),dim=-1)
+        # code = torch.cat((est_vel,latent),dim=-1)
+        code = est_vel
         return code,est_vel
 
     def act(self, obs_history, **kwargs):
@@ -99,7 +101,24 @@ class ActorCritic_EstNet(ActorCritic):
         """
         code,_ = self.estnet_forward(obs_history)
         now_obs = obs_history[:, -self.one_obs_len:]
-        observations = torch.cat((code.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前面
+
+        # TODO:对critic进行检查，real_vel不正确设置就报错
+        # 实现adaboot
+        critic_obs = kwargs.get("critic_obs", None)
+        # rewards = kwargs.get("rewards", None)
+        real_vel = critic_obs[:, 0:3]
+        # if critic_obs is not None and rewards is not None:
+        #     real_vel = critic_obs[:, 0:3]
+        #     CV_R = torch.std(rewards) / torch.mean(rewards)
+        #     p_boot = 1 - torch.tanh(CV_R)
+        #     random_tensor = torch.rand(real_vel.shape, device=rewards.device)
+        #     code[:, 0:3] = torch.where(random_tensor < p_boot.expand_as(random_tensor), real_vel, code[:, 0:3])
+        #     # 完全使用真实值，用于debug
+        #     # code[:, 0:3] = real_vel
+        
+        observations = torch.cat((code.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前
+        # observations = torch.cat((real_vel.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前
+        # observations = now_obs # 隐向量放在当前观测值前
         self.update_distribution(observations)
         return self.distribution.sample()
 

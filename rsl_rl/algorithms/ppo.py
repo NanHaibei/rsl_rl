@@ -94,20 +94,35 @@ class PPO:
 
         # PPO components 
         # policy其实是ActorCritic
-        self.policy = policy
+        self.policy: ActorCritic | ActorCritic_EstNet = policy
         self.policy.to(self.device)
-        # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        # Create rollout storage
-        # 创建经验回放池存储类
-        self.storage: RolloutStorage = None  # type: ignore
-        self.transition = RolloutStorage.Transition()
 
         # 如果使用了EstmateNet
         if isinstance(self.policy, ActorCritic_EstNet):
             self.estnet = True
         else:
             self.estnet = False
+
+        # Create optimizer
+        if self.estnet:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters()},
+                # {'params': self.policy.encode_latent.parameters()},
+                {'params': self.policy.encode_vel.parameters()},
+            ], lr=learning_rate)
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # Create rollout storage
+        # 创建经验回放池存储类
+        self.storage: RolloutStorage = None  # type: ignore
+        self.transition = RolloutStorage.Transition()
+
+
 
         # PPO parameters
         # 记录PPO超参数
@@ -145,11 +160,13 @@ class PPO:
             self.device,
         )
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, **kwargs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
+        # 将rewards传入act进行adaboot
+        rewards = kwargs.get("rewards", None)
+        self.transition.actions = self.policy.act(obs, critic_obs=critic_obs,rewards=rewards).detach()
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -272,7 +289,7 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(obs_batch, critic_obs=critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -318,6 +335,8 @@ class PPO:
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
+                    for param_group in self.encoder_optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
 
             # Estimate Net 速度估计损失
             if self.estnet:
@@ -325,6 +344,12 @@ class PPO:
                 vel_target = critic_obs_batch[:,0:3]
                 vel_target.requires_grad = False
                 vel_MSE = nn.MSELoss()(vel_est, vel_target)
+
+                self.encoder_optimizer.zero_grad()
+                vel_MSE.backward(retain_graph=True)
+                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
+                self.encoder_optimizer.step()
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -345,10 +370,12 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            if self.estnet:
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + vel_MSE
-            else:
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # if self.estnet:
+            #     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + vel_MSE
+            # else:
+            #     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:

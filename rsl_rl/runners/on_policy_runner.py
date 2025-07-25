@@ -221,6 +221,7 @@ class OnPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        rewards = None
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
@@ -228,13 +229,14 @@ class OnPolicyRunner:
                 # 一个学习迭代包含多个环境步数
                 for _ in range(self.num_steps_per_env):
                     # Sample actions 网络输出动作值
-                    actions = self.alg.act(obs, privileged_obs)
+                    actions = self.alg.act(obs, privileged_obs, rewards=rewards)
                     # Step the environment 环境根据动作值输出五元组
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # perform normalization 观测值归一化 
                     obs = self.obs_normalizer(obs)
+                    test = obs.tolist()[0]
                     # 为DWAQ保存下一次观测值
                     if self.dwaq:
                         self.alg.transition.next_observations = obs

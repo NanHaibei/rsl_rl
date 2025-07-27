@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic, ActorCritic_EstNet
+from rsl_rl.modules import ActorCritic, ActorCritic_EstNet, ActorCritic_DWAQ
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -99,10 +99,7 @@ class PPO:
 
         # 如果使用了EstmateNet
         self.estnet = True if isinstance(self.policy, ActorCritic_EstNet) else False
-        # if isinstance(self.policy, ActorCritic_EstNet):
-        #     self.estnet = True
-        # else:
-        #     self.estnet = False
+        self.dwaq = True if isinstance(self.policy, ActorCritic_DWAQ) else False
 
         # Create optimizer
         if self.estnet:
@@ -116,6 +113,20 @@ class PPO:
                 {'params': self.policy.encode_latent.parameters()},
                 {'params': self.policy.encode_vel.parameters()},
             ], lr=learning_rate)
+        elif self.dwaq:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters()},
+                {'params': self.policy.encode_mean_latent.parameters()},
+                {'params': self.policy.encode_logvar_latent.parameters()},
+                {'params': self.policy.encode_mean_vel.parameters()},
+                {'params': self.policy.encode_logvar_vel.parameters()},
+                {'params': self.policy.decoder.parameters()},
+            ], lr=learning_rate)
         else:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
@@ -123,8 +134,6 @@ class PPO:
         # 创建经验回放池存储类
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
-
-
 
         # PPO parameters
         # 记录PPO超参数
@@ -229,10 +238,10 @@ class PPO:
         else:
             mean_symmetry_loss = None
         # -- vel est loss
-        if self.estnet:
-            mean_vel_loss = 0
-        else:
-            mean_vel_loss = None
+        mean_vel_loss = 0 if self.estnet or self.dwaq else None
+        # -- DWAQ loss
+        mean_obs_loss = 0 if self.dwaq else None
+        mean_dkl_loss = 0 if self.dwaq else None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -354,6 +363,29 @@ class PPO:
                 grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
                 self.encoder_optimizer.step()
 
+            if self.dwaq:
+                code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_batch) 
+                vel_target = critic_obs_batch[:,0:3]
+                decode_target = next_observations_batch
+                vel_target.requires_grad = False
+                decode_target.requires_grad = False
+                # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
+                vel_MSE = nn.MSELoss()(code_vel, vel_target)
+                # obs_MSE = nn.MSELoss()(decode, decode_target)
+                # KL散度损失：按批次平均
+                # dkl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(), dim=1))
+                # autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
+
+                autoenc_loss = vel_MSE
+
+                self.encoder_optimizer.zero_grad()
+                autoenc_loss.backward(retain_graph=True)
+            
+            # 检查梯度并进行更保守的裁剪
+            encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+            grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
+            self.encoder_optimizer.step()
+
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -372,11 +404,6 @@ class PPO:
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
-
-            # if self.estnet:
-            #     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + vel_MSE
-            # else:
-            #     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -458,6 +485,11 @@ class PPO:
             # -- vel est loss
             if mean_vel_loss is not None:
                 mean_vel_loss += vel_MSE.item()
+            # -- DWAQ loss
+            # if mean_obs_loss is not None:
+            #     mean_obs_loss += obs_MSE.item()
+            # if mean_dkl_loss is not None:
+            #     mean_dkl_loss += dkl_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -473,6 +505,13 @@ class PPO:
         # -- For vel est
         if mean_vel_loss is not None:
             mean_vel_loss /= num_updates
+        # -- For DWAQ
+        if mean_vel_loss is not None:
+            mean_vel_loss /= num_updates
+        if mean_obs_loss is not None:
+            mean_obs_loss /= num_updates
+        if mean_dkl_loss is not None:
+            mean_dkl_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -488,6 +527,9 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if self.estnet:
             loss_dict["vel_loss"] = mean_vel_loss
+        if self.dwaq:
+            loss_dict["obs_loss"] = mean_obs_loss
+            loss_dict["dkl_loss"] = mean_dkl_loss
 
         return loss_dict
 

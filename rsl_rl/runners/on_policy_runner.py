@@ -12,7 +12,7 @@ import torch
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, PPO_DWAQ, Distillation
+from rsl_rl.algorithms import PPO, Distillation
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -40,17 +40,13 @@ class OnPolicyRunner:
         self._configure_multi_gpu()
 
         # resolve training type depending on the algorithm
-        if self.alg_cfg["class_name"] == "PPO" or self.alg_cfg["class_name"] == "PPO_DWAQ":
+        if self.alg_cfg["class_name"] == "PPO":
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
             
-        if self.alg_cfg["class_name"] == "PPO_DWAQ":
-            self.dwaq = True
-        else:
-            self.dwaq = False
 
         # resolve dimensions of observations
         # 获取观测值
@@ -109,7 +105,7 @@ class OnPolicyRunner:
         # 从cfg中取出算法类名称，并得到类指针，默认值是PPO
         alg_class = eval(self.alg_cfg.pop("class_name"))
         # 实例化算法类
-        self.alg: PPO | PPO_DWAQ | Distillation = alg_class(
+        self.alg: PPO | Distillation = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

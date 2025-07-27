@@ -98,26 +98,27 @@ class PPO:
         self.policy.to(self.device)
 
         # 如果使用了EstmateNet
-        if isinstance(self.policy, ActorCritic_EstNet):
-            self.estnet = True
-        else:
-            self.estnet = False
+        self.estnet = True if isinstance(self.policy, ActorCritic_EstNet) else False
+        # if isinstance(self.policy, ActorCritic_EstNet):
+        #     self.estnet = True
+        # else:
+        #     self.estnet = False
 
         # Create optimizer
-        # if self.estnet:
-        #     self.optimizer = torch.optim.Adam([
-        #         {'params': self.policy.actor.parameters()},
-        #         {'params': self.policy.critic.parameters()},
-        #         {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-        #     ], lr=learning_rate)
-        #     self.encoder_optimizer = torch.optim.Adam([
-        #         {'params': self.policy.encoder.parameters()},
-        #         {'params': self.policy.encode_latent.parameters()},
-        #         {'params': self.policy.encode_vel.parameters()},
-        #     ], lr=learning_rate)
-        # else:
-        #     self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        if self.estnet:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters()},
+                {'params': self.policy.encode_latent.parameters()},
+                {'params': self.policy.encode_vel.parameters()},
+            ], lr=learning_rate)
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
         # 创建经验回放池存储类
         self.storage: RolloutStorage = None  # type: ignore
@@ -253,6 +254,7 @@ class PPO:
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            next_observations_batch
         ) in generator:
 
             # number of augmentations per sample
@@ -336,8 +338,8 @@ class PPO:
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
-                    # for param_group in self.encoder_optimizer.param_groups:
-                    #     param_group["lr"] = self.learning_rate
+                    for param_group in self.encoder_optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
 
             # Estimate Net 速度估计损失
             if self.estnet:
@@ -346,11 +348,11 @@ class PPO:
                 vel_target.requires_grad = False
                 vel_MSE = nn.MSELoss()(vel_est, vel_target)
 
-                # self.encoder_optimizer.zero_grad()
-                # vel_MSE.backward(retain_graph=True)
-                # encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
-                # grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
-                # self.encoder_optimizer.step()
+                self.encoder_optimizer.zero_grad()
+                vel_MSE.backward(retain_graph=True)
+                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
+                self.encoder_optimizer.step()
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -371,12 +373,12 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            if self.estnet:
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + vel_MSE
-            else:
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # if self.estnet:
+            #     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + vel_MSE
+            # else:
+            #     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             
-            # loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:

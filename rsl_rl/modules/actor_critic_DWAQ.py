@@ -143,9 +143,13 @@ class ActorCritic_DWAQ(ActorCritic):
         logvar_vel = self.encode_logvar_vel(x) # 得到速度的对数方差
         logvar_vel = torch.clip(logvar_vel,min=-10,max=10)
 
-        code_latent = self.reparameterise(mean_latent,logvar_latent)
-        code_vel = self.reparameterise(mean_vel,logvar_vel)
-        code = torch.cat((code_vel,code_latent),dim=-1)
+        # code_latent = self.reparameterise(mean_latent,logvar_latent)
+        # code_vel = self.reparameterise(mean_vel,logvar_vel)
+        code_latent = mean_latent
+        code_vel = mean_vel
+
+        # code = torch.cat((code_vel,code_latent),dim=-1)
+        code = code_vel
         decode = self.decoder(code)
         return code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent
 
@@ -158,7 +162,10 @@ class ActorCritic_DWAQ(ActorCritic):
         """
         code,_,_,_,_,_,_ = self.cenet_forward(obs_history)
         now_obs = obs_history[:, -self.one_obs_len:]
+        critic_obs = kwargs.get("critic_obs", None)
+        real_vel = critic_obs[:, 0:3]
         observations = torch.cat((code.detach(), now_obs),dim=-1) # 隐向量放在当前观测值前面
+        # observations = torch.cat((real_vel.detach(),now_obs),dim=-1)
         self.update_distribution(observations)
         return self.distribution.sample()
 

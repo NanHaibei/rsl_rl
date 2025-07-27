@@ -101,22 +101,35 @@ class PPO_DWAQ(PPO):
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-
-        # self.vae_optimizer = torch.optim.Adam([
-        #     {'params': self.policy.encoder.parameters()},
-        #     {'params': self.policy.encode_mean_latent.parameters()},
-        #     {'params': self.policy.encode_logvar_latent.parameters()},
-        #     {'params': self.policy.encode_mean_vel.parameters()},
-        #     {'params': self.policy.encode_logvar_vel.parameters()},
-        #     {'params': self.policy.decoder.parameters()},
-        # ], lr=vae_learning_rate)
-
-        # self.ac_optimizer = torch.optim.Adam([
-        #     {'params': self.policy.actor.parameters()},
-        #     {'params': self.policy.critic.parameters()},
-        #     {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-        # ], lr=learning_rate)
+        # if self.estnet:
+        #     self.optimizer = torch.optim.Adam([
+        #         {'params': self.policy.actor.parameters()},
+        #         {'params': self.policy.critic.parameters()},
+        #         {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+        #     ], lr=learning_rate)
+        #     self.encoder_optimizer = torch.optim.Adam([
+        #         {'params': self.policy.encoder.parameters()},
+        #         {'params': self.policy.encode_logvar_latent.parameters()},
+        #         {'params': self.policy.encode_mean_latent.parameters()},
+        #         {'params': self.policy.encode_logvar_vel.parameters()},
+        #         {'params': self.policy.encode_mean_vel.parameters()},
+        #         {'params': self.policy.decoder.parameters()},
+        #     ], lr=learning_rate)
+        # else:
+        #     self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = torch.optim.Adam([
+            {'params': self.policy.actor.parameters()},
+            {'params': self.policy.critic.parameters()},
+            {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+        ], lr=learning_rate)
+        self.encoder_optimizer = torch.optim.Adam([
+            {'params': self.policy.encoder.parameters()},
+            # {'params': self.policy.encode_logvar_latent.parameters()},
+            # {'params': self.policy.encode_mean_latent.parameters()},
+            {'params': self.policy.encode_logvar_vel.parameters()},
+            {'params': self.policy.encode_mean_vel.parameters()},
+            {'params': self.policy.decoder.parameters()},
+        ], lr=learning_rate)
 
         # 创建经验回放池存储类
         self.storage: RolloutStorageNextObs = None  # type: ignore
@@ -163,19 +176,19 @@ class PPO_DWAQ(PPO):
             self.device,
         )
 
-    def act(self, obs, critic_obs):
-        if self.policy.is_recurrent:
-            self.transition.hidden_states = self.policy.get_hidden_states()
-        # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
-        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
-        self.transition.action_mean = self.policy.action_mean.detach()
-        self.transition.action_sigma = self.policy.action_std.detach()
-        # need to record obs and critic_obs before env.step()
-        self.transition.observations = obs
-        self.transition.privileged_observations = critic_obs
-        return self.transition.actions
+    # def act(self, obs, critic_obs):
+    #     if self.policy.is_recurrent:
+    #         self.transition.hidden_states = self.policy.get_hidden_states()
+    #     # compute the actions and values
+    #     self.transition.actions = self.policy.act(obs).detach()
+    #     self.transition.values = self.policy.evaluate(critic_obs).detach()
+    #     self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+    #     self.transition.action_mean = self.policy.action_mean.detach()
+    #     self.transition.action_sigma = self.policy.action_std.detach()
+    #     # need to record obs and critic_obs before env.step()
+    #     self.transition.observations = obs
+    #     self.transition.privileged_observations = critic_obs
+    #     return self.transition.actions
 
 
     def update(self):  # noqa: C901
@@ -255,7 +268,7 @@ class PPO_DWAQ(PPO):
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(obs_batch, critic_obs=critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -314,18 +327,20 @@ class PPO_DWAQ(PPO):
             decode_target.requires_grad = False
             # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
             vel_MSE = nn.MSELoss()(code_vel, vel_target)
-            obs_MSE = nn.MSELoss()(decode, decode_target)
+            # obs_MSE = nn.MSELoss()(decode, decode_target)
             # KL散度损失：按批次平均
-            dkl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(), dim=1))
-            autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
+            # dkl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(), dim=1))
+            # autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
+
+            autoenc_loss = vel_MSE
             
-            # self.vae_optimizer.zero_grad()
-            # autoenc_loss.backward(retain_graph=True)
+            self.encoder_optimizer.zero_grad()
+            autoenc_loss.backward(retain_graph=True)
             
             # 检查梯度并进行更保守的裁剪
-            # vae_params = [p for group in self.vae_optimizer.param_groups for p in group['params']]
-            # grad_norm = nn.utils.clip_grad_norm_(vae_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
-            # self.vae_optimizer.step()
+            encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+            grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
+            self.encoder_optimizer.step()
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -346,7 +361,7 @@ class PPO_DWAQ(PPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + autoenc_loss
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -427,8 +442,8 @@ class PPO_DWAQ(PPO):
             mean_entropy += entropy_batch.mean().item()
             mean_autoenc_loss += autoenc_loss.item()
             mean_vel_MSE += vel_MSE.item()
-            mean_OBS_MSE += obs_MSE.item()
-            mean_DKL_loss += dkl_loss.item()
+            # mean_OBS_MSE += obs_MSE.item()
+            # mean_DKL_loss += dkl_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()

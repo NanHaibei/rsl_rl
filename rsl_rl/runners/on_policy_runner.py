@@ -236,10 +236,8 @@ class OnPolicyRunner:
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # perform normalization 观测值归一化 
                     obs = self.obs_normalizer(obs)
-                    test = obs.tolist()[0]
-                    # 为DWAQ保存下一次观测值
-                    if self.dwaq:
-                        self.alg.transition.next_observations = obs
+                    # 保存下一次观测值
+                    self.alg.transition.next_observations = obs
                     # 如果有特权观测值，对其进行归一化
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(

@@ -242,6 +242,7 @@ class PPO:
         # -- DWAQ loss
         mean_obs_loss = 0 if self.dwaq else None
         mean_dkl_loss = 0 if self.dwaq else None
+        mean_dwaq_loss = 0 if self.dwaq else None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -482,10 +483,12 @@ class PPO:
             if mean_vel_loss is not None:
                 mean_vel_loss += vel_MSE.item()
             # -- DWAQ loss
-            # if mean_obs_loss is not None:
-            #     mean_obs_loss += obs_MSE.item()
-            # if mean_dkl_loss is not None:
-            #     mean_dkl_loss += dkl_loss.item()
+            if mean_obs_loss is not None:
+                mean_obs_loss += obs_MSE.item()
+            if mean_dkl_loss is not None:
+                mean_dkl_loss += dkl_loss.item()
+            if mean_dwaq_loss is not None:
+                mean_dwaq_loss += autoenc_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -508,6 +511,8 @@ class PPO:
             mean_obs_loss /= num_updates
         if mean_dkl_loss is not None:
             mean_dkl_loss /= num_updates
+        if mean_dwaq_loss is not None:
+            mean_dwaq_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -526,6 +531,7 @@ class PPO:
         if self.dwaq:
             loss_dict["obs_loss"] = mean_obs_loss
             loss_dict["dkl_loss"] = mean_dkl_loss
+            loss_dict["dwaq_loss"] = mean_dwaq_loss
 
         return loss_dict
 

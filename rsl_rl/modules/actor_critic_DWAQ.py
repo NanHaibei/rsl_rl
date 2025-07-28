@@ -29,31 +29,37 @@ class ActorCritic_DWAQ(ActorCritic_EstNet):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         num_history_len = 5,
-        print_networks=True,
         **kwargs,
     ):
         # 初始化父类
-        super().__init__(        
-            num_actor_obs,
-            num_critic_obs,
-            num_actions,
-            num_latent,
-            encoder_hidden_dims,
-            actor_hidden_dims,
-            critic_hidden_dims,
-            activation,
-            init_noise_std,
-            noise_std_type,
-            num_history_len,
-            print_networks=False,  # 打印网络结构
-            **kwargs
-        )
+        # super().__init__(        
+        #     num_actor_obs,
+        #     num_critic_obs,
+        #     num_actions,
+        #     num_latent,
+        #     encoder_hidden_dims,
+        #     actor_hidden_dims,
+        #     critic_hidden_dims,
+        #     activation,
+        #     init_noise_std,
+        #     noise_std_type,
+        #     num_history_len,
+        #     **kwargs
+        # )
 
-        # 获取一帧obs的长度
-        self.one_obs_len: int = int(num_actor_obs / num_history_len)
+        if kwargs:
+            print(
+                "ActorCritic_DWAQ.__init__ got unexpected arguments, which will be ignored: "
+                + str([key for key in kwargs.keys()])
+            )
+        # 初始化nn.Module
+        self._init_nn()
 
         # 返回已经实例化的激活函数类
         activation = resolve_nn_activation(activation)
+
+        # 获取一帧obs的长度
+        self.one_obs_len: int = int(num_actor_obs / num_history_len)
 
         
         # Policy 构建actor网络
@@ -67,6 +73,18 @@ class ActorCritic_DWAQ(ActorCritic_EstNet):
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
         self.actor = nn.Sequential(*actor_layers)
+
+        # Value function 构建critic网络
+        critic_layers = []
+        critic_layers.append(nn.Linear(num_critic_obs, critic_hidden_dims[0]))
+        critic_layers.append(activation)
+        for layer_index in range(len(critic_hidden_dims)):
+            if layer_index == len(critic_hidden_dims) - 1:
+                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+            else:
+                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
+                critic_layers.append(activation)
+        self.critic = nn.Sequential(*critic_layers)
 
         #  构建encoder网络
         encoder_layers = []
@@ -95,14 +113,27 @@ class ActorCritic_DWAQ(ActorCritic_EstNet):
         self.decoder = nn.Sequential(*decoder_layers)
 
         # 输出四个网络的结构
-        if print_networks:
-            print(f"Actor MLP: {self.actor}")
-            print(f"Encoder MLP: {self.encoder}")
-            print(f"Encoder latent mean: {self.encoder_latent_mean}")
-            print(f"Encoder latent logvar: {self.encoder_latent_logvar}")
-            print(f"Encoder velocity mean: {self.encoder_vel_mean}")
-            print(f"Encoder velocity logvar: {self.encoder_vel_logvar}")
-            print(f"Decoder MLP: {self.decoder}")
+        print(f"Actor MLP: {self.actor}")
+        print(f"Encoder MLP: {self.encoder}")
+        print(f"Encoder latent mean: {self.encoder_latent_mean}")
+        print(f"Encoder latent logvar: {self.encoder_latent_logvar}")
+        print(f"Encoder velocity mean: {self.encoder_vel_mean}")
+        print(f"Encoder velocity logvar: {self.encoder_vel_logvar}")
+        print(f"Decoder MLP: {self.decoder}")
+
+        # Action noise 设置正态分布的初始标准差
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+
+        # Action distribution (populated in update_distribution)
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args(False)
     
     def reparameterise(self,mean,logvar):
         """重参数化

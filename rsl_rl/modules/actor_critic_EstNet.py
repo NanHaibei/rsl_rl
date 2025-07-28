@@ -28,27 +28,32 @@ class ActorCritic_EstNet(ActorCritic):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         num_history_len = 5,
-        print_networks: bool = True,
         **kwargs,
     ):
         # 初始化父类
-        super().__init__(        
-            num_actor_obs,
-            num_critic_obs,
-            num_actions,
-            actor_hidden_dims,
-            critic_hidden_dims,
-            activation,
-            init_noise_std,
-            noise_std_type,
-            print_networks=print_networks,
-            **kwargs
-        )
-
+        # super().__init__(        
+        #     num_actor_obs,
+        #     num_critic_obs,
+        #     num_actions,
+        #     actor_hidden_dims,
+        #     critic_hidden_dims,
+        #     activation,
+        #     init_noise_std,
+        #     noise_std_type,
+        #     print_networks=print_networks,
+        #     **kwargs
+        # )
+        if kwargs:
+            print(
+                "ActorCritic_EstNet.__init__ got unexpected arguments, which will be ignored: "
+                + str([key for key in kwargs.keys()])
+            )
+        # 初始化nn.Module
+        self._init_nn()
+        
+        activation = resolve_nn_activation(activation)
         # 获取一帧obs的长度
         self.one_obs_len: int = int(num_actor_obs / num_history_len)
-
-        activation = resolve_nn_activation(activation)
 
         # Policy 构建actor网络
         actor_layers = []
@@ -61,6 +66,18 @@ class ActorCritic_EstNet(ActorCritic):
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
         self.actor = nn.Sequential(*actor_layers)
+
+        # Value function 构建critic网络
+        critic_layers = []
+        critic_layers.append(nn.Linear(num_critic_obs, critic_hidden_dims[0]))
+        critic_layers.append(activation)
+        for layer_index in range(len(critic_hidden_dims)):
+            if layer_index == len(critic_hidden_dims) - 1:
+                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+            else:
+                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
+                critic_layers.append(activation)
+        self.critic = nn.Sequential(*critic_layers)
 
         # 构建encoder网络
         encoder_layers = []
@@ -75,11 +92,24 @@ class ActorCritic_EstNet(ActorCritic):
         self.encode_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
 
         # 输出网络结构
-        if print_networks:
-            print(f"Actor MLP: {self.actor}")
-            print(f"Encoder MLP: {self.encoder}")
-            print(f"Encoder latent: {self.encode_latent}")
-            print(f"Encoder velocity: {self.encode_vel}")
+        print(f"Actor MLP: {self.actor}")
+        print(f"Encoder MLP: {self.encoder}")
+        print(f"Encoder latent: {self.encode_latent}")
+        print(f"Encoder velocity: {self.encode_vel}")
+
+        # Action noise 设置正态分布的初始标准差
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+
+        # Action distribution (populated in update_distribution)
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args(False)
 
 
     def encoder_forward(self,obs_history):

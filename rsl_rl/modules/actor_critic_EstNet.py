@@ -20,7 +20,7 @@ class ActorCritic_EstNet(ActorCritic):
         num_actor_obs,
         num_critic_obs,
         num_actions,
-        num_latent = 27,
+        num_latent = 19,
         encoder_hidden_dims=[256, 256],
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
@@ -28,6 +28,7 @@ class ActorCritic_EstNet(ActorCritic):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         num_history_len = 5,
+        print_networks: bool = True,
         **kwargs,
     ):
         # 初始化父类
@@ -40,6 +41,7 @@ class ActorCritic_EstNet(ActorCritic):
             activation,
             init_noise_std,
             noise_std_type,
+            print_networks=print_networks,
             **kwargs
         )
 
@@ -50,7 +52,6 @@ class ActorCritic_EstNet(ActorCritic):
 
         # Policy 构建actor网络
         actor_layers = []
-        # actor_layers.append(nn.Linear(self.one_obs_len, actor_hidden_dims[0]))
         actor_layers.append(nn.Linear(self.one_obs_len + num_latent, actor_hidden_dims[0]))
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
@@ -74,11 +75,14 @@ class ActorCritic_EstNet(ActorCritic):
         self.encode_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
 
         # 输出网络结构
-        print(f"Actor MLP: {self.actor}")
-        print(f"Encoder MLP: {self.encoder}")
+        if print_networks:
+            print(f"Actor MLP: {self.actor}")
+            print(f"Encoder MLP: {self.encoder}")
+            print(f"Encoder latent: {self.encode_latent}")
+            print(f"Encoder velocity: {self.encode_vel}")
 
 
-    def estnet_forward(self,obs_history):
+    def encoder_forward(self,obs_history):
         """EstNet 前向推理
         Args:
             obs_history (_type_): 历史观测值
@@ -99,7 +103,7 @@ class ActorCritic_EstNet(ActorCritic):
             obs_history (_type_): 当前观测值
             obs_history (_type_): 观测值历史
         """
-        code,_ = self.estnet_forward(obs_history)
+        code,_ = self.encoder_forward(obs_history)
         now_obs = obs_history[:, -self.one_obs_len:]
 
         # TODO:对critic进行检查，real_vel不正确设置就报错
@@ -131,7 +135,7 @@ class ActorCritic_EstNet(ActorCritic):
             obs_history (_type_): _description_
         """
 
-        code,_ = self.estnet_forward(obs_history)
+        code,_ = self.encoder_forward(obs_history)
         now_obs = obs_history[:, -self.one_obs_len:]
         observations = torch.cat((code.detach(),now_obs),dim=-1)
         actions_mean = self.actor(observations)

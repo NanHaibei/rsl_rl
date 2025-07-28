@@ -70,8 +70,8 @@ class DWAQOnnxPolicyExporter(torch.nn.Module):
         self.verbose = verbose
         self.actor = copy.deepcopy(policy.actor)
         self.encoder = copy.deepcopy(policy.encoder)
-        self.encoder_vel_head = copy.deepcopy(policy.encode_vel)
-        self.encoder_latent_head = copy.deepcopy(policy.encode_latent)
+        self.encoder_vel_head = copy.deepcopy(policy.encoder_vel_mean)
+        self.encoder_latent_head = copy.deepcopy(policy.encoder_latent_mean)
         self.obs_normalizer = copy.deepcopy(obs_normalizer)
         self.path = path
         self.file_name = file_name

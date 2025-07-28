@@ -19,7 +19,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCritic_EstNet 
+    policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ
     """The actor critic module."""
 
     def __init__(
@@ -94,12 +94,12 @@ class PPO:
 
         # PPO components 
         # policy其实是ActorCritic
-        self.policy: ActorCritic | ActorCritic_EstNet = policy
+        self.policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ = policy
         self.policy.to(self.device)
 
         # 如果使用了EstmateNet
-        self.estnet = True if isinstance(self.policy, ActorCritic_EstNet) else False
-        self.dwaq = True if isinstance(self.policy, ActorCritic_DWAQ) else False
+        self.estnet = True if type(self.policy) == ActorCritic_EstNet else False
+        self.dwaq = True if type(self.policy) == ActorCritic_DWAQ else False
 
         # Create optimizer
         if self.estnet:
@@ -121,10 +121,10 @@ class PPO:
             ], lr=learning_rate)
             self.encoder_optimizer = torch.optim.Adam([
                 {'params': self.policy.encoder.parameters()},
-                {'params': self.policy.encode_mean_latent.parameters()},
-                {'params': self.policy.encode_logvar_latent.parameters()},
-                {'params': self.policy.encode_mean_vel.parameters()},
-                {'params': self.policy.encode_logvar_vel.parameters()},
+                {'params': self.policy.encoder_latent_mean.parameters()},
+                {'params': self.policy.encoder_latent_logvar.parameters()},
+                {'params': self.policy.encoder_vel_mean.parameters()},
+                {'params': self.policy.encoder_vel_logvar.parameters()},
                 {'params': self.policy.decoder.parameters()},
             ], lr=learning_rate)
         else:
@@ -350,9 +350,9 @@ class PPO:
                     for param_group in self.encoder_optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Estimate Net 速度估计损失
+            # Estimate Net step
             if self.estnet:
-                _,vel_est = self.policy.estnet_forward(obs_batch) 
+                _,vel_est = self.policy.encoder_forward(obs_batch) 
                 vel_target = critic_obs_batch[:,0:3]
                 vel_target.requires_grad = False
                 vel_MSE = nn.MSELoss()(vel_est, vel_target)
@@ -363,28 +363,24 @@ class PPO:
                 grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
                 self.encoder_optimizer.step()
 
+            # DWAQ step
             if self.dwaq:
-                code,code_vel,decode,mean_vel,logvar_vel,mean_latent,logvar_latent = self.policy.cenet_forward(obs_batch) 
+                code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(obs_batch) 
                 vel_target = critic_obs_batch[:,0:3]
-                decode_target = next_observations_batch
+                obs_target = next_observations_batch
                 vel_target.requires_grad = False
-                decode_target.requires_grad = False
+                obs_target.requires_grad = False
                 # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
-                vel_MSE = nn.MSELoss()(code_vel, vel_target)
-                # obs_MSE = nn.MSELoss()(decode, decode_target)
+                vel_MSE = nn.MSELoss()(vel_sample, vel_target)
+                obs_MSE = nn.MSELoss()(decode, obs_target)
                 # KL散度损失：按批次平均
-                # dkl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(), dim=1))
-                # autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
-
-                autoenc_loss = vel_MSE
-
+                dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
+                autoenc_loss = vel_MSE + obs_MSE + 1.0 * dkl_loss # beta目前是1.0
                 self.encoder_optimizer.zero_grad()
                 autoenc_loss.backward(retain_graph=True)
-            
-            # 检查梯度并进行更保守的裁剪
-            encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
-            grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
-            self.encoder_optimizer.step()
+                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
+                self.encoder_optimizer.step()
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -525,7 +521,7 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if self.estnet:
+        if self.estnet or self.dwaq:
             loss_dict["vel_loss"] = mean_vel_loss
         if self.dwaq:
             loss_dict["obs_loss"] = mean_obs_loss

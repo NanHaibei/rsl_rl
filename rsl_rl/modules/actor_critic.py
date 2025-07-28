@@ -25,6 +25,7 @@ class ActorCritic(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
+        print_networks: bool = True,
         **kwargs,
     ):
         if kwargs:
@@ -63,8 +64,9 @@ class ActorCritic(nn.Module):
         self.critic = nn.Sequential(*critic_layers)
 
         # 输出两个网络的结构
-        print(f"Actor MLP: {self.actor}")
-        print(f"Critic MLP: {self.critic}")
+        if print_networks:
+            print(f"Actor MLP: {self.actor}")
+            print(f"Critic MLP: {self.critic}")
 
         # Action noise 设置正态分布的初始标准差
         self.noise_std_type = noise_std_type

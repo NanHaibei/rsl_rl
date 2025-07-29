@@ -348,8 +348,9 @@ class PPO:
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
-                    for param_group in self.encoder_optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    if self.estnet or self.dwaq:
+                        for param_group in self.encoder_optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
 
             # Estimate Net step
             if self.estnet:

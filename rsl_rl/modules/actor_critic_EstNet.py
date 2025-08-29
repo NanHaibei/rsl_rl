@@ -123,7 +123,6 @@ class ActorCritic_EstNet(ActorCritic):
         est_vel = self.encode_vel(x) # 得到速度估计值
 
         code = torch.cat((est_vel,latent),dim=-1)
-        # code = est_vel
         return code,est_vel
 
     def act(self, obs_history, **kwargs):
@@ -134,21 +133,22 @@ class ActorCritic_EstNet(ActorCritic):
             obs_history (_type_): 观测值历史
         """
         code,_ = self.encoder_forward(obs_history)
-        now_obs = obs_history[:, -self.one_obs_len:]
+        now_obs = obs_history[:, 0:self.one_obs_len]
 
         # TODO:对critic进行检查，real_vel不正确设置就报错
         # 实现adaboot
-        critic_obs = kwargs.get("critic_obs", None)
+        # critic_obs = kwargs.get("critic_obs", None)
         # rewards = kwargs.get("rewards", None)
-        real_vel = critic_obs[:, 0:3]
+        # real_vel = critic_obs[:, 0:3]
         # if critic_obs is not None and rewards is not None:
         #     real_vel = critic_obs[:, 0:3]
+        #     rewards = torch.clamp(rewards, 0, 99999) # 防止负的奖励进入std函数
         #     CV_R = torch.std(rewards) / torch.mean(rewards)
         #     p_boot = 1 - torch.tanh(CV_R)
         #     random_tensor = torch.rand(real_vel.shape, device=rewards.device)
         #     code[:, 0:3] = torch.where(random_tensor < p_boot.expand_as(random_tensor), real_vel, code[:, 0:3])
-        #     # 完全使用真实值，用于debug
-        #     # code[:, 0:3] = real_vel
+            # 完全使用真实值，用于debug
+            # code[:, 0:3] = real_vel
         
         observations = torch.cat((code.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前
         # observations = torch.cat((real_vel.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前

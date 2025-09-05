@@ -88,14 +88,18 @@ class ActorCritic_EstNet(ActorCritic):
             encoder_layers.append(activation)
         self.encoder = nn.Sequential(*encoder_layers)
 
-        self.encode_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
+        
         self.encode_vel = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
 
         # 输出网络结构
         print(f"Actor MLP: {self.actor}")
         print(f"Encoder MLP: {self.encoder}")
-        print(f"Encoder latent: {self.encode_latent}")
         print(f"Encoder velocity: {self.encode_vel}")
+
+        # if num_latent > 3:
+        # print(f"Encoder latent: {self.encode_latent}")
+        # self.encode_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
+        
 
         # Action noise 设置正态分布的初始标准差
         self.noise_std_type = noise_std_type
@@ -119,10 +123,11 @@ class ActorCritic_EstNet(ActorCritic):
 
         """
         x = self.encoder(obs_history)
-        latent = self.encode_latent(x) # 得到隐向量
+        # latent = self.encode_latent(x) # 得到隐向量
         est_vel = self.encode_vel(x) # 得到速度估计值
 
-        code = torch.cat((est_vel,latent),dim=-1)
+        # code = torch.cat((est_vel,latent),dim=-1)
+        code = est_vel
         return code,est_vel
 
     def act(self, obs_history, **kwargs):

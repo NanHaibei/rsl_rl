@@ -230,7 +230,9 @@ class OnPolicyRunner:
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # perform normalization 观测值归一化 
+                    # 检查是否有inf或者nan
+                    self.check_tensors(step=it, actions=actions, obs=obs, rewards=rewards, dones=dones, infos=infos)
+                    # perform normalization 观测值归一化
                     obs = self.obs_normalizer(obs)
                     # 保存下一次观测值
                     self.alg.transition.next_observations = obs
@@ -564,3 +566,36 @@ class OnPolicyRunner:
         torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
+
+
+    def check_tensors(self, step, actions=None, obs=None, rewards=None, dones=None, infos=None):
+        """
+        检查传入的张量/字典/列表中是否含有 NaN 或 Inf，并区分打印
+        """
+        def _check(name, x):
+            if isinstance(x, torch.Tensor):
+                has_nan = torch.isnan(x).any()
+                has_inf = torch.isinf(x).any()
+                if has_nan or has_inf:
+                    msg = f"[Step {step}] ⚠️ {name} "
+                    if has_nan:
+                        msg += "contains NaN "
+                    if has_inf:
+                        msg += "contains Inf "
+                    if x.numel() > 0:
+                        msg += f"(shape={tuple(x.shape)}, min={x.min().item()}, max={x.max().item()})"
+                    print(msg)
+            elif isinstance(x, (list, tuple)):
+                for i, v in enumerate(x):
+                    _check(f"{name}[{i}]", v)
+            elif isinstance(x, dict):
+                for k, v in x.items():
+                    _check(f"{name}.{k}", v)
+            # 其他非 tensor 类型忽略
+
+        _check("actions", actions)
+        _check("obs", obs)
+        _check("rewards", rewards)
+        _check("dones", dones)
+        _check("infos", infos)
+

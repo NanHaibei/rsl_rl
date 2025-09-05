@@ -110,7 +110,7 @@ class PPO:
             ], lr=learning_rate)
             self.encoder_optimizer = torch.optim.Adam([
                 {'params': self.policy.encoder.parameters()},
-                {'params': self.policy.encode_latent.parameters()},
+                # {'params': self.policy.encode_latent.parameters()},
                 {'params': self.policy.encode_vel.parameters()},
             ], lr=learning_rate)
         elif self.dwaq:

@@ -19,23 +19,24 @@ class EstNetOnnxPolicyExporter(torch.nn.Module):
         self.actor = copy.deepcopy(policy.actor)
         self.encoder = copy.deepcopy(policy.encoder)
         self.encoder_vel_head = copy.deepcopy(policy.encode_vel)
-        self.encoder_latent_head = copy.deepcopy(policy.encode_latent)
+        # self.encoder_latent_head = copy.deepcopy(policy.encode_latent)
         self.obs_normalizer = copy.deepcopy(obs_normalizer)
         self.path = path
         self.file_name = file_name
-        self.latent_len = self.encoder_vel_head.out_features + self.encoder_latent_head.out_features
-        self.one_obs_len = self.actor[0].in_features - self.latent_len  # 一帧观测值的长度
+        # self.latent_len = self.encoder_vel_head.out_features + self.encoder_latent_head.out_features
+        # self.one_obs_len = self.actor[0].in_features - self.latent_len  # 一帧观测值的长度
+        self.one_obs_len = self.actor[0].in_features - 3  # 一帧观测值的长度
 
     def forward(self, obs):
         obs_noarmalized = self.obs_normalizer(obs)
         x = self.encoder(obs_noarmalized)
-        vel = self.encoder_vel_head(x)
-        latent = self.encoder_latent_head(x)
-        code = torch.cat((vel, latent), dim=-1)
-        now_obs = obs_noarmalized[:, -self.one_obs_len:]  # 获取当前观测值
-        observations = torch.cat((code.detach(), now_obs), dim=-1)
+        est_vel = self.encoder_vel_head(x)
+        # latent = self.encoder_latent_head(x)
+        # code = torch.cat((vel, latent), dim=-1)
+        now_obs = obs_noarmalized[:, 0:self.one_obs_len]  # 获取当前观测值
+        observations = torch.cat((est_vel.detach(), now_obs), dim=-1)
         actions_mean = self.actor(observations)
-        return actions_mean, vel
+        return actions_mean, est_vel
     
     def export(self):
         if not os.path.exists(self.path):
@@ -84,7 +85,7 @@ class DWAQOnnxPolicyExporter(torch.nn.Module):
         vel = self.encoder_vel_head(x)
         latent = self.encoder_latent_head(x)
         code = torch.cat((vel, latent), dim=-1)
-        now_obs = obs_noarmalized[:, -self.one_obs_len:]  # 获取当前观测值
+        now_obs = obs_noarmalized[:, 0:self.one_obs_len]  # 获取当前观测值
         observations = torch.cat((code.detach(), now_obs), dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean, vel

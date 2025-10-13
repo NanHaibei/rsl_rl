@@ -30,19 +30,7 @@ class ActorCritic_EstNet(ActorCritic):
         num_history_len = 5,
         **kwargs,
     ):
-        # 初始化父类
-        # super().__init__(        
-        #     num_actor_obs,
-        #     num_critic_obs,
-        #     num_actions,
-        #     actor_hidden_dims,
-        #     critic_hidden_dims,
-        #     activation,
-        #     init_noise_std,
-        #     noise_std_type,
-        #     print_networks=print_networks,
-        #     **kwargs
-        # )
+
         if kwargs:
             print(
                 "ActorCritic_EstNet.__init__ got unexpected arguments, which will be ignored: "
@@ -96,11 +84,6 @@ class ActorCritic_EstNet(ActorCritic):
         print(f"Encoder MLP: {self.encoder}")
         print(f"Encoder velocity: {self.encode_vel}")
 
-        # if num_latent > 3:
-        # print(f"Encoder latent: {self.encode_latent}")
-        # self.encode_latent = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
-        
-
         # Action noise 设置正态分布的初始标准差
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
@@ -139,21 +122,6 @@ class ActorCritic_EstNet(ActorCritic):
         """
         code,_ = self.encoder_forward(obs_history)
         now_obs = obs_history[:, 0:self.one_obs_len]
-
-        # TODO:对critic进行检查，real_vel不正确设置就报错
-        # 实现adaboot
-        # critic_obs = kwargs.get("critic_obs", None)
-        # rewards = kwargs.get("rewards", None)
-        # real_vel = critic_obs[:, 0:3]
-        # if critic_obs is not None and rewards is not None:
-        #     real_vel = critic_obs[:, 0:3]
-        #     rewards = torch.clamp(rewards, 0, 99999) # 防止负的奖励进入std函数
-        #     CV_R = torch.std(rewards) / torch.mean(rewards)
-        #     p_boot = 1 - torch.tanh(CV_R)
-        #     random_tensor = torch.rand(real_vel.shape, device=rewards.device)
-        #     code[:, 0:3] = torch.where(random_tensor < p_boot.expand_as(random_tensor), real_vel, code[:, 0:3])
-            # 完全使用真实值，用于debug
-            # code[:, 0:3] = real_vel
         
         observations = torch.cat((code.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前
         # observations = torch.cat((real_vel.detach(),now_obs),dim=-1) # 隐向量放在当前观测值前

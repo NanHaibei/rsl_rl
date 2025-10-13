@@ -221,7 +221,7 @@ class ActorCritic_DWAQ(ActorCritic_EstNet):
         mean_vel = self.encoder_vel_mean(x)
         mean_latent = self.encoder_latent_mean(x)
         code = torch.cat((mean_vel,mean_latent),dim=-1)
-        now_obs = obs_history[:, -self.one_obs_len:]
+        now_obs = obs_history[:, 0:self.one_obs_len]
         observations = torch.cat((code.detach(), now_obs),dim=-1)
         actions_mean = self.actor(observations)
         return actions_mean

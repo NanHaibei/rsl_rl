@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic, ActorCritic_EstNet, ActorCritic_DWAQ
+from rsl_rl.modules import ActorCritic, ActorCritic_EstNet, ActorCritic_DWAQ, ActorCritic_DeltaSine
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,7 +19,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ
+    policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine
     """The actor critic module."""
 
     def __init__(
@@ -94,12 +94,13 @@ class PPO:
 
         # PPO components 
         # policy其实是ActorCritic
-        self.policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ = policy
+        self.policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine = policy
         self.policy.to(self.device)
 
         # 如果使用了EstmateNet
         self.estnet = True if type(self.policy) == ActorCritic_EstNet else False
         self.dwaq = True if type(self.policy) == ActorCritic_DWAQ else False
+        # self.delta_sine = True if type(self.policy) == ActorCritic_DeltaSine else False
 
         # Create optimizer
         if self.estnet:

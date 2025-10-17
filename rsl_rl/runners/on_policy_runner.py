@@ -21,7 +21,8 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
-    ActorCritic_DWAQ
+    ActorCritic_DWAQ,
+    ActorCritic_DeltaSine
 )
 from rsl_rl.utils import store_code_state
 
@@ -77,9 +78,15 @@ class OnPolicyRunner:
         # 从cfg中取出策略类名称，并得到类指针，默认值是ActorCritic
         policy_class = eval(self.policy_cfg.pop("class_name"))
         # 实例化策略类
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | ActorCritic_EstNet | ActorCritic_DWAQ = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        # if isinstance(policy_class, ActorCritic_DeltaSine):
+        if policy_class is ActorCritic_DeltaSine:
+            policy: ActorCritic_DeltaSine = policy_class(
+                num_obs, num_privileged_obs, self.env.num_actions, self.env, **self.policy_cfg
+            ).to(self.device)
+        else:
+            policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | ActorCritic_EstNet | ActorCritic_DWAQ  = policy_class(
+                num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
 
         # resolve dimension of rnd gated state
         # RND算法相关的内容 TODO: 看RND论文

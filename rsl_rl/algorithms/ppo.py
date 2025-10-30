@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.modules import ActorCritic, ActorCritic_EstNet, ActorCritic_DWAQ, ActorCritic_DeltaSine
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -20,7 +20,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent
+    policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine
     """The actor critic module."""
 
     def __init__(
@@ -59,6 +59,7 @@ class PPO:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
+
         # RND components
         if rnd_cfg is not None:
             # Extract parameters used in ppo
@@ -96,18 +97,52 @@ class PPO:
         else:
             self.symmetry = None
 
-        # PPO components
-        self.policy = policy
+        # PPO components 
+        # policy其实是ActorCritic
+        self.policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine = policy
         self.policy.to(self.device)
 
-        # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # 如果使用了EstmateNet
+        self.estnet = True if type(self.policy) == ActorCritic_EstNet else False
+        self.dwaq = True if type(self.policy) == ActorCritic_DWAQ else False
+        # self.delta_sine = True if type(self.policy) == ActorCritic_DeltaSine else False
 
+        # Create optimizer
+        if self.estnet:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters()},
+                # {'params': self.policy.encode_latent.parameters()},
+                {'params': self.policy.encode_vel.parameters()},
+            ], lr=learning_rate)
+        elif self.dwaq:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters()},
+                {'params': self.policy.encoder_latent_mean.parameters()},
+                {'params': self.policy.encoder_latent_logvar.parameters()},
+                {'params': self.policy.encoder_vel_mean.parameters()},
+                {'params': self.policy.encoder_vel_logvar.parameters()},
+                {'params': self.policy.decoder.parameters()},
+            ], lr=learning_rate)
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
-        self.storage: RolloutStorage | None = None
+        # 创建经验回放池存储类
+        self.storage: RolloutStorage | None = None  # type: ignore
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
+        # 记录PPO超参数
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
@@ -140,12 +175,14 @@ class PPO:
             self.device,
         )
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
+    def act(self, obs, critic_obs, **kwargs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
-        # Compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()
+        # compute the actions and values
+        # 将rewards传入act进行adaboot
+        rewards = kwargs.get("rewards", None)
+        self.transition.actions = self.policy.act(obs, critic_obs=critic_obs,rewards=rewards).detach()
+        self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -195,10 +232,22 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        # RND loss
-        mean_rnd_loss = 0 if self.rnd else None
-        # Symmetry loss
-        mean_symmetry_loss = 0 if self.symmetry else None
+        # -- RND loss
+        if self.rnd:
+            mean_rnd_loss = 0
+        else:
+            mean_rnd_loss = None
+        # -- Symmetry loss
+        if self.symmetry:
+            mean_symmetry_loss = 0
+        else:
+            mean_symmetry_loss = None
+        # -- vel est loss
+        mean_vel_loss = 0 if self.estnet or self.dwaq else None
+        # -- DWAQ loss
+        mean_obs_loss = 0 if self.dwaq else None
+        mean_dkl_loss = 0 if self.dwaq else None
+        mean_dwaq_loss = 0 if self.dwaq else None
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -218,6 +267,8 @@ class PPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            rnd_state_batch,
+            next_observations_batch
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -246,8 +297,9 @@ class PPO:
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             # Recompute actions log prob and entropy for current batch of transitions
-            # Note: We need to do this because we updated the policy with the new parameters
-            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+            # Note: we need to do this because we updated the policy with the new parameters
+            # -- actor
+            self.policy.act(obs_batch, critic_obs=critic_obs_batch, masks=masks_batch, hidden_states=hidden_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             # Note: We only keep the entropy of the first augmentation (the original one)
@@ -290,6 +342,41 @@ class PPO:
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
+                    if self.estnet or self.dwaq:
+                        for param_group in self.encoder_optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
+
+            # Estimate Net step
+            if self.estnet:
+                _,vel_est = self.policy.encoder_forward(obs_batch) 
+                vel_target = critic_obs_batch[:,0:3]
+                vel_target.requires_grad = False
+                vel_MSE = nn.MSELoss()(vel_est, vel_target)
+
+                self.encoder_optimizer.zero_grad()
+                vel_MSE.backward(retain_graph=True)
+                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
+                self.encoder_optimizer.step()
+
+            # DWAQ step
+            if self.dwaq:
+                code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(obs_batch) 
+                vel_target = critic_obs_batch[:,0:3]
+                obs_target = next_observations_batch
+                vel_target.requires_grad = False
+                obs_target.requires_grad = False
+                # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
+                vel_MSE = nn.MSELoss()(vel_sample, vel_target)
+                obs_MSE = nn.MSELoss()(decode, obs_target)
+                # KL散度损失：按批次平均
+                dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
+                autoenc_loss = vel_MSE + obs_MSE + 1.0 * dkl_loss # beta目前是1.0
+                self.encoder_optimizer.zero_grad()
+                autoenc_loss.backward(retain_graph=True)
+                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
+                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
+                self.encoder_optimizer.step()
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -309,7 +396,7 @@ class PPO:
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
-
+            
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
@@ -389,6 +476,16 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # -- vel est loss
+            if mean_vel_loss is not None:
+                mean_vel_loss += vel_MSE.item()
+            # -- DWAQ loss
+            if mean_obs_loss is not None:
+                mean_obs_loss += obs_MSE.item()
+            if mean_dkl_loss is not None:
+                mean_dkl_loss += dkl_loss.item()
+            if mean_dwaq_loss is not None:
+                mean_dwaq_loss += autoenc_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -399,8 +496,19 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-
-        # Clear the storage
+        # -- For vel est
+        if mean_vel_loss is not None:
+            mean_vel_loss /= num_updates
+        # -- For DWAQ
+        if mean_vel_loss is not None:
+            mean_vel_loss /= num_updates
+        if mean_obs_loss is not None:
+            mean_obs_loss /= num_updates
+        if mean_dkl_loss is not None:
+            mean_dkl_loss /= num_updates
+        if mean_dwaq_loss is not None:
+            mean_dwaq_loss /= num_updates
+        # -- Clear the storage
         self.storage.clear()
 
         # Construct the loss dictionary
@@ -413,6 +521,12 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.estnet or self.dwaq:
+            loss_dict["vel_loss"] = mean_vel_loss
+        if self.dwaq:
+            loss_dict["obs_loss"] = mean_obs_loss
+            loss_dict["dkl_loss"] = mean_dkl_loss
+            loss_dict["dwaq_loss"] = mean_dwaq_loss
 
         return loss_dict
 

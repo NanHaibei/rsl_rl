@@ -26,6 +26,7 @@ class RolloutStorage:
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+            self.next_observations: TensorDict | None = None
 
         def clear(self) -> None:
             self.__init__()
@@ -55,7 +56,14 @@ class RolloutStorage:
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
-        # For distillation
+        # next obs
+        self.next_observations = TensorDict(
+            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
+            batch_size=[num_transitions_per_env, num_envs],
+            device=self.device,
+        )
+
+        # for distillation
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
@@ -86,7 +94,10 @@ class RolloutStorage:
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
-        # For distillation
+        # next obs
+        self.next_observations[self.step].copy_(transition.next_observations)
+
+        # for distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
 
@@ -171,6 +182,8 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
+        # next obs
+        next_observations = self.next_observations.flatten(0, 1)
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -188,6 +201,11 @@ class RolloutStorage:
                 # Create the mini-batch
                 obs_batch = observations[batch_idx]
                 actions_batch = actions[batch_idx]
+
+                # -- next obs
+                next_observations_batch = next_observations[batch_idx]
+
+                # -- For PPO
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
@@ -214,6 +232,7 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
+                    next_observations_batch
                 )
 
     # For reinforcement learning with recurrent networks

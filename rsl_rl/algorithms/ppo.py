@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCritic_EstNet, ActorCritic_DWAQ, ActorCritic_DeltaSine
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCritic_EstNet, ActorCritic_DWAQ, ActorCritic_DeltaSine
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -20,7 +20,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine
+    policy: ActorCritic | ActorCriticRecurrent | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine
     """The actor critic module."""
 
     def __init__(
@@ -138,7 +138,7 @@ class PPO:
         # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
         # 创建经验回放池存储类
-        self.storage: RolloutStorage | None = None  # type: ignore
+        self.storage: RolloutStorage | None = None
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -233,15 +233,9 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
         # -- RND loss
-        if self.rnd:
-            mean_rnd_loss = 0
-        else:
-            mean_rnd_loss = None
+        mean_rnd_loss = 0 if self.rnd else None
         # -- Symmetry loss
-        if self.symmetry:
-            mean_symmetry_loss = 0
-        else:
-            mean_symmetry_loss = None
+        mean_symmetry_loss = 0 if self.symmetry else None
         # -- vel est loss
         mean_vel_loss = 0 if self.estnet or self.dwaq else None
         # -- DWAQ loss
@@ -267,7 +261,6 @@ class PPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
-            rnd_state_batch,
             next_observations_batch
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
@@ -299,6 +292,11 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
             self.policy.act(obs_batch, critic_obs=critic_obs_batch, masks=masks_batch, hidden_states=hidden_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
@@ -396,7 +394,6 @@ class PPO:
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
-            
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss

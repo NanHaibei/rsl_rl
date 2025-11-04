@@ -6,23 +6,18 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
-from .actor_critic_DWAQ import ActorCritic_DWAQ
-from .actor_critic_EstNet import ActorCritic_EstNet
-from .actor_critic_DeltaSine import ActorCritic_DeltaSine
 from .actor_critic_recurrent import ActorCriticRecurrent
-from .normalizer import EmpiricalNormalization
-from .rnd import RandomNetworkDistillation
+from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
+from .symmetry import resolve_symmetry_config
 
 __all__ = [
     "ActorCritic",
-    "ActorCritic_DWAQ",
-    "ActorCritic_EstNet",
-    "ActorCritic_DeltaSine",
     "ActorCriticRecurrent",
-    "EmpiricalNormalization",
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",
+    "resolve_rnd_config",
+    "resolve_symmetry_config",
 ]

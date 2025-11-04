@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -20,12 +20,12 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet,
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -98,14 +98,14 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ = policy
         self.policy.to(self.device)
         # 如果使用了EstNet与DWAQ
-        self.estnet =  False
-        self.dwaq =  False
+        self.estnet = False
+        self.dwaq = False
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!记得改
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
-        # self.dwaq = True if type(self.policy) == ActorCritic_DWAQ else False
+        self.dwaq = True if type(self.policy) == ActorCriticDWAQ else False
         # self.delta_sine = True if type(self.policy) == ActorCritic_DeltaSine else False
 
         # Create optimizer
@@ -118,20 +118,20 @@ class PPO:
             self.encoder_optimizer = torch.optim.Adam([
                 {'params': self.policy.encoder.parameters()},
             ], lr=learning_rate)
-        # elif self.dwaq:
-        #     self.optimizer = torch.optim.Adam([
-        #         {'params': self.policy.actor.parameters()},
-        #         {'params': self.policy.critic.parameters()},
-        #         {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-        #     ], lr=learning_rate)
-        #     self.encoder_optimizer = torch.optim.Adam([
-        #         {'params': self.policy.encoder.parameters()},
-        #         {'params': self.policy.encoder_latent_mean.parameters()},
-        #         {'params': self.policy.encoder_latent_logvar.parameters()},
-        #         {'params': self.policy.encoder_vel_mean.parameters()},
-        #         {'params': self.policy.encoder_vel_logvar.parameters()},
-        #         {'params': self.policy.decoder.parameters()},
-        #     ], lr=learning_rate)
+        elif self.dwaq:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder_backbone.parameters()},
+                {'params': self.policy.encoder_latent_mean.parameters()},
+                {'params': self.policy.encoder_latent_logvar.parameters()},
+                {'params': self.policy.encoder_vel_mean.parameters()},
+                {'params': self.policy.encoder_vel_logvar.parameters()},
+                {'params': self.policy.decoder.parameters()},
+            ], lr=learning_rate)
         else:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
@@ -341,7 +341,7 @@ class PPO:
                 vel_est = self.policy.encoder_forward(policy_obs) 
                 vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
                 vel_target.requires_grad = False
-                vel_MSE = nn.MSELoss()(vel_est, vel_target)
+                vel_MSE = nn.MSELoss()(vel_est, vel_target) * 1000.0 # 小数使用L2loss后太小了，没有梯度
 
                 self.encoder_optimizer.zero_grad()
                 vel_MSE.backward(retain_graph=True)
@@ -351,17 +351,23 @@ class PPO:
 
             # DWAQ step
             if self.dwaq:
-                code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(obs_batch) 
-                vel_target = critic_obs_batch[:,0:3]
-                obs_target = next_observations_batch
+                policy_obs = self.policy.get_actor_obs(obs_batch)
+                policy_obs = self.policy.actor_obs_normalizer(policy_obs)
+                code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(policy_obs) 
+                vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
+                next_observations = self.policy.get_actor_obs(next_observations_batch)
+                next_observations = self.policy.actor_obs_normalizer(next_observations)
+                obs_target = next_observations[:, 0:self.policy.obs_one_frame_len]  # 取最新一帧obs
+                
                 vel_target.requires_grad = False
                 obs_target.requires_grad = False
                 # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
-                vel_MSE = nn.MSELoss()(vel_sample, vel_target)
-                obs_MSE = nn.MSELoss()(decode, obs_target)
+                vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 10.0
+                obs_MSE = nn.MSELoss()(decode, obs_target) * 10.0
                 # KL散度损失：按批次平均
                 dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
-                autoenc_loss = vel_MSE + obs_MSE + 1.0 * dkl_loss # beta目前是1.0
+                beta = 1.0
+                autoenc_loss = vel_MSE + obs_MSE + beta * dkl_loss # beta目前是1.0
                 self.encoder_optimizer.zero_grad()
                 autoenc_loss.backward(retain_graph=True)
                 encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]

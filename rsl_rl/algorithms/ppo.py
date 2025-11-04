@@ -11,8 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
-# from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCritic_EstNet, ActorCritic_DWAQ, ActorCritic_DeltaSine
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -21,14 +20,12 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent
-    # policy: ActorCritic | ActorCriticRecurrent | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent,
-        # policy: ActorCritic | ActorCriticRecurrent | ActorCritic_EstNet | ActorCritic_DWAQ | ActorCritic_DeltaSine,
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -101,28 +98,26 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet = policy
         self.policy.to(self.device)
-        # 如果使用了EstmateNet
+        # 如果使用了EstNet与DWAQ
         self.estnet =  False
         self.dwaq =  False
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!记得改
-        # self.estnet = True if type(self.policy) == ActorCritic_EstNet else False
+        self.estnet = True if type(self.policy) == ActorCriticEstNet else False
         # self.dwaq = True if type(self.policy) == ActorCritic_DWAQ else False
         # self.delta_sine = True if type(self.policy) == ActorCritic_DeltaSine else False
 
         # Create optimizer
-        # if self.estnet:
-        #     self.optimizer = torch.optim.Adam([
-        #         {'params': self.policy.actor.parameters()},
-        #         {'params': self.policy.critic.parameters()},
-        #         {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-        #     ], lr=learning_rate)
-        #     self.encoder_optimizer = torch.optim.Adam([
-        #         {'params': self.policy.encoder.parameters()},
-        #         # {'params': self.policy.encode_latent.parameters()},
-        #         {'params': self.policy.encode_vel.parameters()},
-        #     ], lr=learning_rate)
+        if self.estnet:
+            self.optimizer = torch.optim.Adam([
+                {'params': self.policy.actor.parameters()},
+                {'params': self.policy.critic.parameters()},
+                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
+            ], lr=learning_rate)
+            self.encoder_optimizer = torch.optim.Adam([
+                {'params': self.policy.encoder.parameters()},
+            ], lr=learning_rate)
         # elif self.dwaq:
         #     self.optimizer = torch.optim.Adam([
         #         {'params': self.policy.actor.parameters()},
@@ -137,9 +132,9 @@ class PPO:
         #         {'params': self.policy.encoder_vel_logvar.parameters()},
         #         {'params': self.policy.decoder.parameters()},
         #     ], lr=learning_rate)
-        # else:
-        #     self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
@@ -341,8 +336,10 @@ class PPO:
 
             # Estimate Net step
             if self.estnet:
-                _,vel_est = self.policy.encoder_forward(obs_batch) 
-                vel_target = critic_obs_batch[:,0:3]
+                policy_obs = self.policy.get_actor_obs(obs_batch)
+                policy_obs = self.policy.actor_obs_normalizer(policy_obs)
+                vel_est = self.policy.encoder_forward(policy_obs) 
+                vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
                 vel_target.requires_grad = False
                 vel_MSE = nn.MSELoss()(vel_est, vel_target)
 

@@ -12,6 +12,8 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import resolve_symmetry_config
 
+from .actor_critic_EstNet import ActorCriticEstNet
+
 __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
@@ -20,4 +22,6 @@ __all__ = [
     "StudentTeacherRecurrent",
     "resolve_rnd_config",
     "resolve_symmetry_config",
+
+    "ActorCriticEstNet",
 ]

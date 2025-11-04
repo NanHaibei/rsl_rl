@@ -19,7 +19,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
-    # ActorCritic_EstNet,
+    ActorCriticEstNet,
     # ActorCritic_DWAQ,
     # ActorCritic_DeltaSine,
     resolve_rnd_config,
@@ -424,7 +424,7 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 

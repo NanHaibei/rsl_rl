@@ -109,9 +109,9 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs)
+                    actions, extra_info = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device), extra_info)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # 保存下一次观测值

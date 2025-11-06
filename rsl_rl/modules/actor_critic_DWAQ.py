@@ -42,7 +42,8 @@ class ActorCriticDWAQ(nn.Module):
             )
         super().__init__()
 
-        
+        # 传递回Env的额外信息
+        self.extra_info = dict()
 
         # Get the observation dimensions
         self.obs_groups = obs_groups
@@ -218,22 +219,26 @@ class ActorCriticDWAQ(nn.Module):
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        code,_,_,_,_,_,_ = self.encoder_forward(obs)
+        code,vel_sample,_,_,_,_,_ = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
         observation = torch.cat((code.detach(),now_obs),dim=-1)
         self._update_distribution(observation)
-        return self.distribution.sample()
+        # 记录速度估计值
+        self.extra_info["est_vel"] = vel_sample
+        return self.distribution.sample(), self.extra_info
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        code,_,_,_,_,_,_ = self.encoder_forward(obs)
+        code,vel_sample,_,_,_,_,_ = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
         observation = torch.cat((code.detach(),now_obs),dim=-1)
+        # 记录速度估计值
+        self.extra_info["est_vel"] = vel_sample
         if self.state_dependent_std:
-            return self.actor(observation)[..., 0, :]
+            return self.actor(observation)[..., 0, :], self.extra_info
         else:
-            return self.actor(observation)
+            return self.actor(observation), self.extra_info
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_critic_obs(obs)

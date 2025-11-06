@@ -177,14 +177,15 @@ class PPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.actions, extra_info = self.policy.act(obs)
+        self.transition.actions = self.transition.actions.detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         # Record observations before env.step()
         self.transition.observations = obs
-        return self.transition.actions
+        return self.transition.actions, extra_info
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
@@ -406,7 +407,7 @@ class PPO:
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                 # Actions predicted by the actor for symmetrically-augmented observations
-                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+                mean_actions_batch, _ = self.policy.act_inference(obs_batch.detach().clone())
 
                 # Compute the symmetrically augmented actions
                 # Note: We are assuming the first augmentation is the original one. We do not use the action_batch from

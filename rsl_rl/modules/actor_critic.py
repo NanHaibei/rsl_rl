@@ -38,6 +38,9 @@ class ActorCritic(nn.Module):
             )
         super().__init__()
 
+        # 传递回Env的额外信息
+        self.extra_info = dict()
+
         # Get the observation dimensions
         self.obs_groups = obs_groups
         num_actor_obs = 0
@@ -149,15 +152,15 @@ class ActorCritic(nn.Module):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         self._update_distribution(obs)
-        return self.distribution.sample()
+        return self.distribution.sample(), self.extra_info
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         if self.state_dependent_std:
-            return self.actor(obs)[..., 0, :]
+            return self.actor(obs)[..., 0, :], self.extra_info
         else:
-            return self.actor(obs)
+            return self.actor(obs), self.extra_info
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_critic_obs(obs)

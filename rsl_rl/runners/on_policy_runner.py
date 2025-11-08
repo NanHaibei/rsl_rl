@@ -22,6 +22,7 @@ from rsl_rl.modules import (
     ActorCriticEstNet,
     ActorCriticDWAQ,
     # ActorCritic_DeltaSine,
+    AMPDiscriminator,
     resolve_rnd_config,
     resolve_symmetry_config
 )
@@ -306,6 +307,12 @@ class OnPolicyRunner:
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        # Save encoder optimizer if used (EstNet or DWAQ)
+        if hasattr(self.alg, "encoder_optimizer") and self.alg.encoder_optimizer:
+            saved_dict["encoder_optimizer_state_dict"] = self.alg.encoder_optimizer.state_dict()
+        # Save AMP discriminator optimizer if used
+        if hasattr(self.alg, "amp_discriminator_optimizer") and self.alg.amp_discriminator_optimizer:
+            saved_dict["amp_discriminator_optimizer_state_dict"] = self.alg.amp_discriminator_optimizer.state_dict()
         # Save RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -327,6 +334,14 @@ class OnPolicyRunner:
         if load_optimizer and resumed_training:
             # Algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # Encoder optimizer if used (EstNet or DWAQ)
+            if hasattr(self.alg, "encoder_optimizer") and self.alg.encoder_optimizer:
+                if "encoder_optimizer_state_dict" in loaded_dict:
+                    self.alg.encoder_optimizer.load_state_dict(loaded_dict["encoder_optimizer_state_dict"])
+            # AMP discriminator optimizer if used
+            if hasattr(self.alg, "amp_discriminator_optimizer") and self.alg.amp_discriminator_optimizer:
+                if "amp_discriminator_optimizer_state_dict" in loaded_dict:
+                    self.alg.amp_discriminator_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
             # RND optimizer if used
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
@@ -427,6 +442,19 @@ class OnPolicyRunner:
         actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+
+        # 如果使用了AMP
+        if self.alg_cfg.get("use_AMP", False):
+            # 初始化判别器网络
+            amp_discriminator = AMPDiscriminator(
+                obs["amp_policy"].shape[-1] * 2,  # 当前帧 + 下一帧
+                self.cfg["amp_reward_coef"],
+                self.cfg["amp_discr_hidden_dims"],
+                self.device,
+                self.cfg["amp_task_reward_lerp"],
+            ).to(self.device)
+            # 将 discriminator 作为成员变量添加到 actor_critic 对象
+            actor_critic.amp_discriminator = amp_discriminator
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))

@@ -47,11 +47,16 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
-        **kwargs: dict[str, Any], # TODO:看怎么去掉这个参数
+        # Training configuration (从 runner 传递)
+        train_cfg: dict | None = None,
+        # **kwargs: dict[str, Any], # TODO:看怎么去掉这个参数
     ) -> None:
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
+
+        # Store training configuration
+        self.train_cfg = train_cfg if train_cfg is not None else {}
 
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -138,7 +143,18 @@ class PPO:
 
         # AMP Discriminator 
         if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
-            self.amp_discriminator_optimizer = torch.optim.Adam(self.policy.amp_discriminator.parameters(), lr=learning_rate)
+            # 判别器学习率：可以从配置中读取，默认为策略学习率的0.5倍
+            amp_cfg = self.train_cfg.get("amp_cfg", {})
+            discr_learning_rate = amp_cfg.get("discr_learning_rate", learning_rate * 0.5)
+            self.amp_discriminator_optimizer = torch.optim.Adam(
+                self.policy.amp_discriminator.parameters(), 
+                lr=discr_learning_rate
+            )
+            print(f"AMP Discriminator learning rate: {discr_learning_rate} (Policy LR: {learning_rate})")
+            
+            # AMP Discriminator parameters
+            self.disc_update_decimation = amp_cfg.get("discr_update_decimation", 1)
+            self.disc_update_counter = 0  # 用于跟踪mini-batch计数
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
@@ -266,6 +282,10 @@ class PPO:
         mean_dwaq_loss = 0 if self.dwaq else None
         # -- AMP loss
         mean_amp_loss = 0 if self.policy.amp_discriminator else None
+        mean_disc_acc = 0 if self.policy.amp_discriminator else None
+        mean_expert_loss = 0 if self.policy.amp_discriminator else None
+        mean_policy_loss = 0 if self.policy.amp_discriminator else None
+        disc_actual_updates = 0  # 记录判别器实际更新的次数
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -289,6 +309,9 @@ class PPO:
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
+
+            # 保存原始的 obs_batch 用于 AMP discriminator（在对称增强之前）
+            obs_batch_original = obs_batch.clone() if self.symmetry and self.symmetry["use_data_augmentation"] else obs_batch
 
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -401,33 +424,60 @@ class PPO:
                 grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
                 self.encoder_optimizer.step()
 
-            # AMP Discriminator step
+            # AMP Discriminator step (每 disc_update_decimation 个 mini-batch 更新一次)
             if self.policy.amp_discriminator:
-                # 获取环境的amp观测
-                amp_env_obs = obs_batch["amp_policy"]
-                amp_next_env_obs = next_observations_batch["amp_policy"]
-                # 获取专家的amp观测 如果直接使用next_observations_batch的话会有某些帧存在跳轨迹的问题
-                amp_expert_obs_len = int(obs_batch["amp_expert"].shape[-1] / 2)
-                amp_expert_obs = obs_batch["amp_expert"][:,:amp_expert_obs_len]
-                amp_expert_next_obs = obs_batch["amp_expert"][:,amp_expert_obs_len:]
-                with torch.no_grad():
-                    amp_env_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_env_obs, self.device)
-                    amp_next_env_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_next_env_obs, self.device)
-                    amp_expert_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_expert_obs, self.device)
-                    amp_expert_next_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_expert_next_obs, self.device)
-                policy_d = self.policy.amp_discriminator(torch.cat([amp_env_obs, amp_next_env_obs], dim=-1))
-                expert_d = self.policy.amp_discriminator(torch.cat([amp_expert_obs, amp_expert_next_obs], dim=-1))
-                expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
-                policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
-                amp_loss = 0.5 * (expert_loss + policy_loss)
-                grad_pen_loss = self.policy.amp_discriminator.compute_grad_pen(amp_expert_obs, amp_expert_next_obs, lambda_=10)
-                amp_loss = amp_loss + grad_pen_loss
+                # 检查是否应该在这个 mini-batch 更新判别器
+                should_update_disc = (self.disc_update_counter % self.disc_update_decimation == 0)
                 
-                # 优化 discriminator
-                self.amp_discriminator_optimizer.zero_grad()
-                amp_loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.amp_discriminator.parameters(), self.max_grad_norm)
-                self.amp_discriminator_optimizer.step()
+                if should_update_disc:
+                    # 使用原始的（未增强的）obs_batch 进行 AMP 判别器训练
+                    amp_obs_batch = obs_batch_original
+                    
+                    # 获取环境的amp观测
+                    amp_env_obs = amp_obs_batch["amp_policy"]
+                    amp_next_env_obs = next_observations_batch["amp_policy"] # 这个不会被对称增强
+                    # 获取专家的amp观测 如果直接使用next_observations_batch的话会有某些帧存在跳轨迹的问题
+                    amp_expert_obs_len = int(amp_obs_batch["amp_expert"].shape[-1] / 2)
+                    amp_expert_obs = amp_obs_batch["amp_expert"][:,:amp_expert_obs_len]
+                    amp_expert_next_obs = amp_obs_batch["amp_expert"][:,amp_expert_obs_len:]
+                    with torch.no_grad():
+                        amp_env_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_env_obs, self.device)
+                        amp_next_env_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_next_env_obs, self.device)
+                        amp_expert_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_expert_obs, self.device)
+                        amp_expert_next_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_expert_next_obs, self.device)
+                    policy_d = self.policy.amp_discriminator(torch.cat([amp_env_obs, amp_next_env_obs], dim=-1))
+                    expert_d = self.policy.amp_discriminator(torch.cat([amp_expert_obs, amp_expert_next_obs], dim=-1))
+                    expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
+                    policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
+                    amp_loss = 0.5 * (expert_loss + policy_loss)
+                    grad_pen_loss = self.policy.amp_discriminator.compute_grad_pen(amp_expert_obs, amp_expert_next_obs, lambda_=10)
+                    amp_loss = amp_loss + grad_pen_loss
+                    
+                    # 计算判别器准确率（用于监控训练状态）
+                    with torch.no_grad():
+                        expert_correct = (expert_d > 0).float().mean()  # 专家数据应该 > 0
+                        policy_correct = (policy_d < 0).float().mean()  # 策略数据应该 < 0
+                        disc_accuracy = (expert_correct + policy_correct) / 2
+                    
+                    # 优化 discriminator
+                    self.amp_discriminator_optimizer.zero_grad()
+                    amp_loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.amp_discriminator.parameters(), self.max_grad_norm)
+                    self.amp_discriminator_optimizer.step()
+
+                    # 更新判别器Normalization
+                    self.policy.amp_discriminator.normalizer.update(amp_env_obs)
+                    self.policy.amp_discriminator.normalizer.update(amp_expert_obs)
+                    
+                    # 只在实际更新时累积 loss 和统计信息
+                    mean_amp_loss += amp_loss.item()
+                    mean_disc_acc += disc_accuracy.item()
+                    mean_expert_loss += expert_loss.item()
+                    mean_policy_loss += policy_loss.item()
+                    disc_actual_updates += 1
+                
+                # 增加计数器（无论是否更新）
+                self.disc_update_counter += 1
 
 
             # Surrogate loss
@@ -538,9 +588,7 @@ class PPO:
                 mean_dkl_loss += dkl_loss.item()
             if mean_dwaq_loss is not None:
                 mean_dwaq_loss += autoenc_loss.item()
-            # AMP loss
-            if mean_amp_loss is not None:
-                mean_amp_loss += amp_loss.item()
+            # AMP loss - 已在判别器更新时累积，这里不需要重复累积
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -563,9 +611,12 @@ class PPO:
             mean_dkl_loss /= num_updates
         if mean_dwaq_loss is not None:
             mean_dwaq_loss /= num_updates
-        # -- For AMP
-        if mean_amp_loss is not None:
-            mean_amp_loss /= num_updates
+        # -- For AMP (使用实际更新次数进行平均)
+        if mean_amp_loss is not None and disc_actual_updates > 0:
+            mean_amp_loss /= disc_actual_updates
+            mean_disc_acc /= disc_actual_updates
+            mean_expert_loss /= disc_actual_updates
+            mean_policy_loss /= disc_actual_updates
         # Clear the storage
         self.storage.clear()
 
@@ -587,6 +638,10 @@ class PPO:
             loss_dict["dwaq_loss"] = mean_dwaq_loss
         if self.policy.amp_discriminator:
             loss_dict["amp_loss"] = mean_amp_loss
+            loss_dict["disc_acc"] = mean_disc_acc
+            loss_dict["expert_loss"] = mean_expert_loss
+            loss_dict["policy_loss"] = mean_policy_loss
+            loss_dict["disc_updates"] = disc_actual_updates
 
         return loss_dict
 

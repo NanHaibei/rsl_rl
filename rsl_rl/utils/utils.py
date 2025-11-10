@@ -321,6 +321,10 @@ class RunningMeanStd:
         self.count = epsilon
 
     def update(self, arr: np.ndarray) -> None:
+        # 如果输入是 PyTorch tensor，转换为 NumPy array
+        if isinstance(arr, torch.Tensor):
+            arr = arr.detach().cpu().numpy()
+        
         batch_mean = np.mean(arr, axis=0)
         batch_var = np.var(arr, axis=0)
         batch_count = arr.shape[0]

@@ -499,7 +499,13 @@ class OnPolicyRunner:
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        alg: PPO = alg_class(
+            actor_critic, 
+            device=self.device, 
+            train_cfg=self.cfg,
+            **self.alg_cfg, 
+            multi_gpu_cfg=self.multi_gpu_cfg
+        )
 
         # Initialize the storage
         alg.init_storage(

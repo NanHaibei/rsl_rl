@@ -34,6 +34,7 @@ class ActorCriticDWAQ(nn.Module):
         state_dependent_std: bool = False,
         num_latent: int = 19,
         num_history_len: int = 5,
+        VAE_beta: float = 1.0,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -44,6 +45,9 @@ class ActorCriticDWAQ(nn.Module):
 
         # 传递回Env的额外信息
         self.extra_info = dict()
+
+        # 记录beta值
+        self.beta = VAE_beta
 
         # Get the observation dimensions
         self.obs_groups = obs_groups

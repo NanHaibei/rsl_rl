@@ -377,8 +377,7 @@ class PPO:
                 obs_MSE = nn.MSELoss()(decode, obs_target) * 10.0
                 # KL散度损失：按批次平均
                 dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
-                beta = 1.0
-                autoenc_loss = vel_MSE + obs_MSE + beta * dkl_loss # beta目前是1.0
+                autoenc_loss = vel_MSE + obs_MSE + self.policy.beta * dkl_loss 
                 self.encoder_optimizer.zero_grad()
                 autoenc_loss.backward(retain_graph=True)
                 encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
@@ -390,9 +389,10 @@ class PPO:
                 # 获取环境的amp观测
                 amp_env_obs = obs_batch["amp_policy"]
                 amp_next_env_obs = next_observations_batch["amp_policy"]
-                # 获取专家的amp观测 如果使用next_observations_batch的话会有某些帧存在跳轨迹的问题
-                amp_expert_obs = obs_batch["amp_expert"][:,:70]
-                amp_expert_next_obs = obs_batch["amp_expert"][:,70:]
+                # 获取专家的amp观测 如果直接使用next_observations_batch的话会有某些帧存在跳轨迹的问题
+                amp_expert_obs_len = int(obs_batch["amp_expert"].shape[-1] / 2)
+                amp_expert_obs = obs_batch["amp_expert"][:,:amp_expert_obs_len]
+                amp_expert_next_obs = obs_batch["amp_expert"][:,amp_expert_obs_len:]
                 with torch.no_grad():
                     amp_env_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_env_obs, self.device)
                     amp_next_env_obs = self.policy.amp_discriminator.normalizer.normalize_torch(amp_next_env_obs, self.device)

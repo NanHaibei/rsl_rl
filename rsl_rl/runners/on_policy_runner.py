@@ -444,14 +444,14 @@ class OnPolicyRunner:
         ).to(self.device)
 
         # 如果使用了AMP
-        if self.alg_cfg.get("use_AMP", False):
+        if self.cfg.get("amp_cfg", False):
             # 初始化判别器网络
             amp_discriminator = AMPDiscriminator(
                 obs["amp_policy"].shape[-1] * 2,  # 当前帧 + 下一帧
-                self.cfg["amp_reward_coef"],
-                self.cfg["amp_discr_hidden_dims"],
+                self.cfg["amp_cfg"]["reward_coef"],
+                self.cfg["amp_cfg"]["discr_hidden_dims"],
                 self.device,
-                self.cfg["amp_task_reward_lerp"],
+                self.cfg["amp_cfg"]["task_reward_lerp"],
             ).to(self.device)
             # 将 discriminator 作为成员变量添加到 actor_critic 对象
             actor_critic.amp_discriminator = amp_discriminator

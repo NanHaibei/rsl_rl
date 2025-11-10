@@ -95,6 +95,15 @@ class OnPolicyRunner:
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        
+        # Create buffers for logging AMP task and style rewards
+        if hasattr(self.alg.policy, 'amp_discriminator') and self.alg.policy.amp_discriminator is not None:
+            task_rewbuffer = deque(maxlen=100)
+            style_rewbuffer = deque(maxlen=100)
+            final_rewbuffer = deque(maxlen=100)
+            cur_task_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_style_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_final_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # Ensure all parameters are in-synced
         if self.is_distributed:
@@ -134,6 +143,14 @@ class OnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                        # Update AMP rewards
+                        if hasattr(self.alg.policy, 'amp_discriminator') and self.alg.policy.amp_discriminator is not None:
+                            if self.alg.task_rewards is not None:
+                                cur_task_reward_sum += self.alg.task_rewards
+                            if self.alg.style_rewards is not None:
+                                cur_style_reward_sum += self.alg.style_rewards
+                            if self.alg.final_rewards is not None:
+                                cur_final_reward_sum += self.alg.final_rewards
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
@@ -147,6 +164,14 @@ class OnPolicyRunner:
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
+                        # Log and clear AMP rewards on episode end
+                        if hasattr(self.alg.policy, 'amp_discriminator') and self.alg.policy.amp_discriminator is not None:
+                            task_rewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            style_rewbuffer.extend(cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            final_rewbuffer.extend(cur_final_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_task_reward_sum[new_ids] = 0
+                            cur_style_reward_sum[new_ids] = 0
+                            cur_final_reward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -238,6 +263,13 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+            
+            # AMP rewards logging
+            if "task_rewbuffer" in locs and len(locs["task_rewbuffer"]) > 0:
+                self.writer.add_scalar("AMP/task_reward", statistics.mean(locs["task_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("AMP/style_reward", statistics.mean(locs["style_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("AMP/final_reward", statistics.mean(locs["final_rewbuffer"]), locs["it"])
+            
             # Everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -266,6 +298,15 @@ class OnPolicyRunner:
                     f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(locs["erewbuffer"]):.2f}\n"""
                     f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(locs["irewbuffer"]):.2f}\n"""
                 )
+            
+            # Print AMP rewards
+            if "task_rewbuffer" in locs and len(locs["task_rewbuffer"]) > 0:
+                log_string += (
+                    f"""{"Mean task reward:":>{pad}} {statistics.mean(locs["task_rewbuffer"]):.2f}\n"""
+                    f"""{"Mean style reward:":>{pad}} {statistics.mean(locs["style_rewbuffer"]):.2f}\n"""
+                    f"""{"Mean final reward:":>{pad}} {statistics.mean(locs["final_rewbuffer"]):.2f}\n"""
+                )
+            
             log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(locs["rewbuffer"]):.2f}\n"""
             # Print episode information
             log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(locs["lenbuffer"]):.2f}\n"""

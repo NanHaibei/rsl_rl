@@ -128,11 +128,11 @@ class AMPDiscriminator(nn.Module):
 
             # d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
             d = self.net(torch.cat([state, next_state], dim=-1))
-            reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
+            style_reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
             if self.task_reward_lerp > 0:
-                reward = self._lerp_reward(reward, task_reward.unsqueeze(-1))
+                final_reward = self._lerp_reward(style_reward, task_reward.unsqueeze(-1))
             self.train()
-        return reward.squeeze(), d
+        return final_reward.squeeze(), style_reward.squeeze(), d
 
     def _lerp_reward(self, disc_r, task_r):
         """

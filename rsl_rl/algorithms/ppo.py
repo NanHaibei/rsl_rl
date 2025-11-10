@@ -16,6 +16,7 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 from typing import Any, NoReturn
+from collections import deque
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
@@ -199,10 +200,26 @@ class PPO:
             self.rnd.update_normalization(obs)
 
         # 如果使用了AMP则重新计算奖励
-        if self.policy.amp_discriminator is not None:
+        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
+            # 保存原始 task reward
+            self.task_rewards = rewards.clone()
+            
+            # 使用 self.transition.observations 作为当前观测，obs 参数作为下一个观测
             amp_obs = self.transition.observations["amp_policy"]
             next_amp_obs = self.transition.next_observations["amp_policy"]
-            rewards = self.policy.amp_discriminator.predict_amp_reward(amp_obs, next_amp_obs, rewards)[0]
+            
+            # 计算 style reward（判别器输出）
+            self.final_rewards, self.style_rewards, _ = self.policy.amp_discriminator.predict_amp_reward(
+                amp_obs, next_amp_obs, self.task_rewards
+            )
+            
+            # 使用 final reward 作为最终奖励
+            rewards = self.final_rewards
+        else:
+            self.task_rewards = None
+            self.style_rewards = None
+            self.final_rewards = None
+            
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()

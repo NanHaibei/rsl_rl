@@ -493,6 +493,7 @@ class OnPolicyRunner:
                 self.cfg["amp_cfg"]["discr_hidden_dims"],
                 self.device,
                 self.cfg["amp_cfg"]["task_reward_lerp"],
+                self.cfg["amp_cfg"].get("discr_nomalize", True),  # 默认使用归一化
             ).to(self.device)
             # 将 discriminator 作为成员变量添加到 actor_critic 对象
             actor_critic.amp_discriminator = amp_discriminator

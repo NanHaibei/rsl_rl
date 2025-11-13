@@ -23,10 +23,11 @@ from rsl_rl.modules import (
     ActorCriticDWAQ,
     # ActorCritic_DeltaSine,
     AMPDiscriminator,
+    Discriminator,
     resolve_rnd_config,
     resolve_symmetry_config
 )
-from rsl_rl.utils import resolve_obs_groups, store_code_state
+from rsl_rl.utils import resolve_obs_groups, store_code_state, AMPLoader, Normalizer
 
 
 class OnPolicyRunner:
@@ -485,25 +486,48 @@ class OnPolicyRunner:
         ).to(self.device)
 
         # 如果使用了AMP
-        if self.cfg.get("amp_cfg", False):
-            # 初始化判别器网络
-            amp_discriminator = AMPDiscriminator(
-                obs["amp_policy"].shape[-1] * 2,  # 当前帧 + 下一帧
-                self.cfg["amp_cfg"]["reward_coef"],
-                self.cfg["amp_cfg"]["discr_hidden_dims"],
-                self.device,
-                self.cfg["amp_cfg"]["task_reward_lerp"],
-                self.cfg["amp_cfg"].get("discr_nomalize", True),  # 默认使用归一化
-            ).to(self.device)
-            # 将 discriminator 作为成员变量添加到 actor_critic 对象
-            actor_critic.amp_discriminator = amp_discriminator
+        # if self.cfg.get("amp_cfg", False):
+        #     # 初始化判别器网络
+        #     amp_discriminator = AMPDiscriminator(
+        #         obs["amp_policy"].shape[-1] * 2,  # 当前帧 + 下一帧
+        #         self.cfg["amp_cfg"]["reward_coef"],
+        #         self.cfg["amp_cfg"]["discr_hidden_dims"],
+        #         self.device,
+        #         self.cfg["amp_cfg"]["task_reward_lerp"],
+        #         self.cfg["amp_cfg"].get("discr_nomalize", True),  # 默认使用归一化
+        #     ).to(self.device)
+        #     # 将 discriminator 作为成员变量添加到 actor_critic 对象
+        #     actor_critic.amp_discriminator = amp_discriminator
+
+        
+
+        amp_data = AMPLoader(
+            self.device,
+            time_between_frames=self.env.unwrapped.step_dt,
+            preload_transitions=True,
+            num_preload_transitions=self.cfg["amp_num_preload_transitions"],
+            motion_files=self.cfg["amp_motion_files"],
+        )
+
+        amp_normalizer = Normalizer(amp_data.observation_dim)
+
+        discriminator = Discriminator(
+            amp_data.observation_dim * 2,
+            self.cfg["amp_reward_coef"],
+            self.cfg["amp_discr_hidden_dims"],
+            self.device,
+            self.cfg["amp_task_reward_lerp"],
+        ).to(self.device)
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
         alg: PPO = alg_class(
             actor_critic, 
             device=self.device, 
+            amp_data=amp_data,
             train_cfg=self.cfg,
+            amp_normalizer=amp_normalizer,
+            discriminator=discriminator,
             **self.alg_cfg, 
             multi_gpu_cfg=self.multi_gpu_cfg
         )

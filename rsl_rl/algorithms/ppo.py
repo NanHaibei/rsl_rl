@@ -11,12 +11,13 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, AMPDiscriminator
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, Discriminator
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import string_to_callable
+from rsl_rl.storage import RolloutStorage, ReplayBuffer
+from rsl_rl.utils import string_to_callable, Normalizer
 from typing import Any, NoReturn
 from collections import deque
+from rsl_rl.utils import AMPLoader
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
@@ -49,7 +50,9 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Training configuration (从 runner 传递)
         train_cfg: dict | None = None,
-        # **kwargs: dict[str, Any], # TODO:看怎么去掉这个参数
+        amp_data: AMPLoader | None = None,
+        discriminator: Discriminator | None = None,
+        amp_normalizer: Normalizer | None = None,
     ) -> None:
         # Device-related parameters
         self.device = device
@@ -141,13 +144,20 @@ class PPO:
         else:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
-        # AMP Discriminator 
-        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
+        # AMP Discriminator
+        self.discriminator = discriminator
+        if self.discriminator is not None:
+
+            self.amp_data = amp_data
+
+            self.amp_transition = RolloutStorage.Transition()
+            self.amp_storage = ReplayBuffer(self.discriminator.input_dim // 2, 100000, device)
+            self.amp_normalizer = amp_normalizer
             # 判别器学习率：可以从配置中读取，默认为策略学习率的0.5倍
             amp_cfg = self.train_cfg.get("amp_cfg", {})
             discr_learning_rate = amp_cfg.get("discr_learning_rate", learning_rate * 0.5)
-            self.amp_discriminator_optimizer = torch.optim.Adam(
-                self.policy.amp_discriminator.parameters(), 
+            self.discriminator_optimizer = torch.optim.Adam(
+                self.discriminator.parameters(),
                 lr=discr_learning_rate
             )
             print(f"AMP Discriminator learning rate: {discr_learning_rate} (Policy LR: {learning_rate})")
@@ -205,6 +215,8 @@ class PPO:
         self.transition.action_sigma = self.policy.action_std.detach()
         # Record observations before env.step()
         self.transition.observations = obs
+        # --------- amp ---------
+        self.amp_transition.observations = obs.get("amp", None)
         return self.transition.actions, extra_info
 
     def process_env_step(
@@ -216,16 +228,16 @@ class PPO:
             self.rnd.update_normalization(obs)
 
         # 如果使用了AMP则重新计算奖励
-        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
+        if self.discriminator is not None:
             # 保存原始 task reward
             self.task_rewards = rewards.clone()
             
             # 使用 self.transition.observations 作为当前观测，obs 参数作为下一个观测
-            amp_obs = self.transition.observations["amp_policy"]
-            next_amp_obs = self.transition.next_observations["amp_policy"]
+            amp_obs = self.transition.observations["amp"]
+            next_amp_obs = self.transition.next_observations["amp"]
             
             # 计算 style reward（判别器输出）
-            self.final_rewards, self.style_rewards, _ = self.policy.amp_discriminator.predict_amp_reward(
+            self.final_rewards, _, _, _ = self.discriminator.predict_amp_reward(
                 amp_obs, next_amp_obs, self.task_rewards
             )
             
@@ -233,7 +245,7 @@ class PPO:
             rewards = self.final_rewards
         else:
             self.task_rewards = None
-            self.style_rewards = None
+            # self.style_rewards = None
             self.final_rewards = None
             
         # Record the rewards and dones
@@ -255,8 +267,10 @@ class PPO:
             )
 
         # Record the transition
+        self.amp_storage.insert(amp_obs, next_amp_obs)
         self.storage.add_transitions(self.transition)
         self.transition.clear()
+        self.amp_transition.clear()
         self.policy.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
@@ -281,15 +295,19 @@ class PPO:
         mean_dkl_loss = 0 if self.dwaq else None
         mean_dwaq_loss = 0 if self.dwaq else None
         # -- AMP loss
-        mean_amp_loss = 0 if self.policy.amp_discriminator else None
-        mean_disc_acc = 0 if self.policy.amp_discriminator else None
-        mean_expert_loss = 0 if self.policy.amp_discriminator else None
-        mean_policy_loss = 0 if self.policy.amp_discriminator else None
-        # -- AMP discriminator output statistics
-        mean_policy_d_mean = 0 if self.policy.amp_discriminator else None
-        mean_policy_d_std = 0 if self.policy.amp_discriminator else None
-        mean_expert_d_mean = 0 if self.policy.amp_discriminator else None
-        mean_expert_d_std = 0 if self.policy.amp_discriminator else None
+        mean_amp_loss = 0
+        mean_grad_pen_loss = 0
+        mean_policy_pred = 0
+        mean_expert_pred = 0
+        # mean_amp_loss = 0 if self.policy.amp_discriminator else None
+        # mean_disc_acc = 0 if self.policy.amp_discriminator else None
+        # mean_expert_loss = 0 if self.policy.amp_discriminator else None
+        # mean_policy_loss = 0 if self.policy.amp_discriminator else None
+        # # -- AMP discriminator output statistics
+        # mean_policy_d_mean = 0 if self.policy.amp_discriminator else None
+        # mean_policy_d_std = 0 if self.policy.amp_discriminator else None
+        # mean_expert_d_mean = 0 if self.policy.amp_discriminator else None
+        # mean_expert_d_std = 0 if self.policy.amp_discriminator else None
         disc_actual_updates = 0  # 记录判别器实际更新的次数
 
         # Get mini batch generator
@@ -298,20 +316,47 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        # --------- amp ---------
+        amp_policy_generator = self.amp_storage.feed_forward_generator(
+            self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
+        )
+        amp_expert_generator = self.amp_data.feed_forward_generator(
+            self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
+        )
+        # --------- amp ---------
+
         # Iterate over batches
-        for (
-            obs_batch,
-            actions_batch,
-            target_values_batch,
-            advantages_batch,
-            returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
-            hidden_states_batch,
-            masks_batch,
-            next_observations_batch
-        ) in generator:
+        # for (
+        #     obs_batch,
+        #     actions_batch,
+        #     target_values_batch,
+        #     advantages_batch,
+        #     returns_batch,
+        #     old_actions_log_prob_batch,
+        #     old_mu_batch,
+        #     old_sigma_batch,
+        #     hidden_states_batch,
+        #     masks_batch,
+        #     next_observations_batch
+        # ) in generator:
+        # 从环境采样的数据 + AMP 策略样本 + AMP 专家样本 同时取出一批
+        for sample, sample_amp_policy, sample_amp_expert in zip(generator, amp_policy_generator, amp_expert_generator):
+            (
+                obs_batch,
+                actions_batch,
+                target_values_batch,
+                advantages_batch,
+                returns_batch,
+                old_actions_log_prob_batch,
+                old_mu_batch,
+                old_sigma_batch,
+                hidden_states_batch,
+                masks_batch,
+                next_observations_batch
+            ) = sample
+
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
 
@@ -430,68 +475,42 @@ class PPO:
                 self.encoder_optimizer.step()
 
             # AMP Discriminator step (每 disc_update_decimation 个 mini-batch 更新一次)
-            if self.policy.amp_discriminator:
-                # 检查是否应该在这个 mini-batch 更新判别器
-                should_update_disc = (self.disc_update_counter % self.disc_update_decimation == 0)
-                
-                if should_update_disc:
-                    # 使用原始的（未增强的）obs_batch 进行 AMP 判别器训练
-                    amp_obs_batch = obs_batch_original
-                    
-                    # 获取环境的amp观测
-                    amp_env_obs = amp_obs_batch["amp_policy"]
-                    amp_next_env_obs = next_observations_batch["amp_policy"] # 这个不会被对称增强
-                    # 获取专家的amp观测 如果直接使用next_observations_batch的话会有某些帧存在跳轨迹的问题
-                    amp_expert_obs_len = int(amp_obs_batch["amp_expert"].shape[-1] / 2)
-                    amp_expert_obs = amp_obs_batch["amp_expert"][:,:amp_expert_obs_len]
-                    amp_expert_next_obs = amp_obs_batch["amp_expert"][:,amp_expert_obs_len:]
-                    
-                    # 使用归一化后的数据训练判别器
-                    policy_d = self.policy.amp_discriminator(amp_env_obs, amp_next_env_obs, update_normalizer=True)
-                    expert_d = self.policy.amp_discriminator(amp_expert_obs, amp_expert_next_obs, update_normalizer=False)
-                    expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
-                    policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
-                    amp_loss = 0.5 * (expert_loss + policy_loss)
-                    grad_pen_loss = self.policy.amp_discriminator.compute_grad_pen(amp_expert_obs, amp_expert_next_obs, lambda_=10)
-                    amp_loss = amp_loss + grad_pen_loss
-                    
-                    # 计算判别器准确率（基于输出值的百分比，而非 bool）
-                    # 判别器输出范围理论上是 [-∞, +∞]，但通常在 [-2, +2] 范围内
-                    # 专家数据：目标 +1，输出越大越好；策略数据：目标 -1，输出越小越好
-                    with torch.no_grad():
-                        # 将输出映射到 [0, 1] 范围：
-                        # expert_d: 从 [-inf, +inf] 映射到 [0, 1]，使用 sigmoid((d - 0) * scale)
-                        # policy_d: 从 [+inf, -inf] 映射到 [0, 1]，使用 sigmoid((0 - d) * scale)
-                        # scale 参数控制映射的陡峭程度，越大越接近硬判断
-                        expert_score = torch.abs(expert_d).mean()  # 专家数据应该 > 0
-                        policy_score = torch.abs(-policy_d).mean()  # 策略数据应该 < 0
-                        disc_accuracy = (expert_score + policy_score) / 2
-                        
-                        # 收集 policy_d 和 expert_d 的统计信息
-                        policy_d_mean = policy_d.mean().item()
-                        policy_d_std = policy_d.std().item()
-                        expert_d_mean = expert_d.mean().item()
-                        expert_d_std = expert_d.std().item()
-                    
-                    # 优化 discriminator
-                    self.amp_discriminator_optimizer.zero_grad()
-                    amp_loss.backward()
-                    nn.utils.clip_grad_norm_(self.policy.amp_discriminator.parameters(), self.max_grad_norm)
-                    self.amp_discriminator_optimizer.step()
-                    
-                    # 只在实际更新时累积 loss 和统计信息
-                    mean_amp_loss += amp_loss.item()
-                    mean_disc_acc += disc_accuracy.item()
-                    mean_expert_loss += expert_loss.item()
-                    mean_policy_loss += policy_loss.item()
-                    mean_policy_d_mean += policy_d_mean
-                    mean_policy_d_std += policy_d_std
-                    mean_expert_d_mean += expert_d_mean
-                    mean_expert_d_std += expert_d_std
-                    disc_actual_updates += 1
-                
-                # 增加计数器（无论是否更新）
-                self.disc_update_counter += 1
+            # Discriminator loss
+            policy_state, policy_next_state = sample_amp_policy
+            expert_state, expert_next_state = sample_amp_expert
+
+            # if self.amp_normalizer is not None:
+            #     self.amp_normalizer.update(policy_state.cpu().numpy())
+            #     self.amp_normalizer.update(expert_state.cpu().numpy())
+            # if self.amp_normalizer is not None:
+            #     with torch.no_grad():
+            #         policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
+            #         policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
+            #         expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
+            #         expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
+
+            policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
+            expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+            expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
+            policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
+            amp_loss = 0.5 * (expert_loss + policy_loss)
+            grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10.0)
+
+            # 判别器的总损失
+            self.amploss_coef=1.0
+            discriminator_loss = self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
+
+            # 更新判别器
+            self.discriminator_optimizer.zero_grad()
+            discriminator_loss.backward()
+            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+            self.discriminator_optimizer.step()
+
+            # Store the losses
+            mean_amp_loss += amp_loss.item()
+            mean_grad_pen_loss += grad_pen_loss.item()
+            mean_policy_pred += policy_d.mean().item()
+            mean_expert_pred += expert_d.mean().item()
 
 
             # Surrogate loss
@@ -626,15 +645,11 @@ class PPO:
         if mean_dwaq_loss is not None:
             mean_dwaq_loss /= num_updates
         # -- For AMP (使用实际更新次数进行平均)
-        if mean_amp_loss is not None and disc_actual_updates > 0:
-            mean_amp_loss /= disc_actual_updates
-            mean_disc_acc /= disc_actual_updates
-            mean_expert_loss /= disc_actual_updates
-            mean_policy_loss /= disc_actual_updates
-            mean_policy_d_mean /= disc_actual_updates
-            mean_policy_d_std /= disc_actual_updates
-            mean_expert_d_mean /= disc_actual_updates
-            mean_expert_d_std /= disc_actual_updates
+        if mean_amp_loss:
+            mean_amp_loss /= num_updates
+            mean_grad_pen_loss /= num_updates
+            mean_policy_pred /= num_updates
+            mean_expert_pred /= num_updates
         # Clear the storage
         self.storage.clear()
 
@@ -643,6 +658,10 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "amp": mean_amp_loss,
+            "amp_grad_pen": mean_grad_pen_loss,
+            "amp_policy_pred": mean_policy_pred,
+            "amp_expert_pred": mean_expert_pred,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -654,16 +673,16 @@ class PPO:
             loss_dict["obs_loss"] = mean_obs_loss
             loss_dict["dkl_loss"] = mean_dkl_loss
             loss_dict["dwaq_loss"] = mean_dwaq_loss
-        if self.policy.amp_discriminator:
-            loss_dict["amp_loss"] = mean_amp_loss
-            loss_dict["disc_acc"] = mean_disc_acc
-            loss_dict["expert_loss"] = mean_expert_loss
-            loss_dict["policy_loss"] = mean_policy_loss
-            loss_dict["disc_updates"] = disc_actual_updates
-            loss_dict["policy_d_mean"] = mean_policy_d_mean
-            loss_dict["policy_d_std"] = mean_policy_d_std
-            loss_dict["expert_d_mean"] = mean_expert_d_mean
-            loss_dict["expert_d_std"] = mean_expert_d_std
+        # if self.policy.amp_discriminator:
+        #     loss_dict["amp_loss"] = mean_amp_loss
+        #     loss_dict["disc_acc"] = mean_disc_acc
+        #     loss_dict["expert_loss"] = mean_expert_loss
+        #     loss_dict["policy_loss"] = mean_policy_loss
+        #     loss_dict["disc_updates"] = disc_actual_updates
+        #     loss_dict["policy_d_mean"] = mean_policy_d_mean
+        #     loss_dict["policy_d_std"] = mean_policy_d_std
+        #     loss_dict["expert_d_mean"] = mean_expert_d_mean
+        #     loss_dict["expert_d_std"] = mean_expert_d_std
 
         return loss_dict
 

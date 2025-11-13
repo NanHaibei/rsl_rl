@@ -6,5 +6,6 @@
 """Implementation of transitions storage for RL-agent."""
 
 from .rollout_storage import RolloutStorage
+from .replay_buffer import ReplayBuffer
 
-__all__ = ["RolloutStorage"]
+__all__ = ["RolloutStorage", "ReplayBuffer"]

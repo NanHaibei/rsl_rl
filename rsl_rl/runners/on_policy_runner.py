@@ -505,18 +505,18 @@ class OnPolicyRunner:
             self.device,
             time_between_frames=self.env.unwrapped.step_dt,
             preload_transitions=True,
-            num_preload_transitions=self.cfg["amp_num_preload_transitions"],
-            motion_files=self.cfg["amp_motion_files"],
+            num_preload_transitions=self.cfg["amp_cfg"]["num_preload_transitions"],
+            motion_files=self.cfg["amp_cfg"]["amp_motion_files"],
         )
 
         amp_normalizer = Normalizer(amp_data.observation_dim)
 
         discriminator = Discriminator(
             amp_data.observation_dim * 2,
-            self.cfg["amp_reward_coef"],
-            self.cfg["amp_discr_hidden_dims"],
+            self.cfg["amp_cfg"]["reward_coef"],
+            self.cfg["amp_cfg"]["discr_hidden_dims"],
             self.device,
-            self.cfg["amp_task_reward_lerp"],
+            self.cfg["amp_cfg"]["task_reward_lerp"],
         ).to(self.device)
 
         # Initialize the algorithm

@@ -50,16 +50,10 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Training configuration (从 runner 传递)
         train_cfg: dict | None = None,
-        amp_data: AMPLoader | None = None,
-        discriminator: Discriminator | None = None,
-        amp_normalizer: Normalizer | None = None,
     ) -> None:
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
-
-        # Store training configuration
-        self.train_cfg = train_cfg if train_cfg is not None else {}
 
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -145,25 +139,15 @@ class PPO:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         # AMP Discriminator
-        self.discriminator = discriminator
-        if self.discriminator is not None:
+        if self.policy.amp_discriminator is not None:
+            amp_cfg = train_cfg["amp_cfg"]
+            self.amp_storage = ReplayBuffer(self.policy.amp_discriminator.input_dim // 2, 100000, device)
 
-            self.amp_data = amp_data
-
-            self.amp_transition = RolloutStorage.Transition()
-            self.amp_storage = ReplayBuffer(self.discriminator.input_dim // 2, 100000, device)
-            self.amp_normalizer = amp_normalizer
-            # 判别器学习率：可以从配置中读取，默认为策略学习率的0.5倍
-            amp_cfg = self.train_cfg.get("amp_cfg", {})
-            discr_learning_rate = amp_cfg.get("discr_learning_rate", learning_rate * 0.5)
-            self.discriminator_optimizer = torch.optim.Adam(
-                self.discriminator.parameters(),
-                lr=discr_learning_rate
-            )
-            print(f"AMP Discriminator learning rate: {discr_learning_rate} (Policy LR: {learning_rate})")
+            # TODO:使用不同的学习率
+            self.discriminator_optimizer = torch.optim.Adam( self.policy.amp_discriminator.parameters(),lr=amp_cfg["discr_learning_rate"],)
             
             # AMP Discriminator parameters
-            self.disc_update_decimation = amp_cfg.get("discr_update_decimation", 1)
+            self.disc_update_decimation = amp_cfg["discr_update_decimation"]
             self.disc_update_counter = 0  # 用于跟踪mini-batch计数
 
         # Create rollout storage
@@ -215,8 +199,6 @@ class PPO:
         self.transition.action_sigma = self.policy.action_std.detach()
         # Record observations before env.step()
         self.transition.observations = obs
-        # --------- amp ---------
-        self.amp_transition.observations = obs.get("amp", None)
         return self.transition.actions, extra_info
 
     def process_env_step(
@@ -228,7 +210,7 @@ class PPO:
             self.rnd.update_normalization(obs)
 
         # 如果使用了AMP则重新计算奖励
-        if self.discriminator is not None:
+        if self.policy.amp_discriminator is not None:
             # 保存原始 task reward
             self.task_rewards = rewards.clone()
             
@@ -237,7 +219,7 @@ class PPO:
             next_amp_obs = self.transition.next_observations["amp"]
             
             # 计算 style reward（判别器输出）
-            self.final_rewards, _, _, _ = self.discriminator.predict_amp_reward(
+            self.final_rewards, self.style_rewards, _, _, _ = self.policy.amp_discriminator.predict_amp_reward(
                 amp_obs, next_amp_obs, self.task_rewards
             )
             
@@ -245,7 +227,7 @@ class PPO:
             rewards = self.final_rewards
         else:
             self.task_rewards = None
-            # self.style_rewards = None
+            self.style_rewards = None
             self.final_rewards = None
             
         # Record the rewards and dones
@@ -270,7 +252,6 @@ class PPO:
         self.amp_storage.insert(amp_obs, next_amp_obs)
         self.storage.add_transitions(self.transition)
         self.transition.clear()
-        self.amp_transition.clear()
         self.policy.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
@@ -321,7 +302,7 @@ class PPO:
             self.num_learning_epochs * self.num_mini_batches,
             self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
         )
-        amp_expert_generator = self.amp_data.feed_forward_generator(
+        amp_expert_generator = self.policy.amp_expert_data.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,
             self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
         )
@@ -361,7 +342,7 @@ class PPO:
             original_batch_size = obs_batch.batch_size[0]
 
             # 保存原始的 obs_batch 用于 AMP discriminator（在对称增强之前）
-            obs_batch_original = obs_batch.clone() if self.symmetry and self.symmetry["use_data_augmentation"] else obs_batch
+            # obs_batch_original = obs_batch.clone()
 
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -474,43 +455,43 @@ class PPO:
                 grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
                 self.encoder_optimizer.step()
 
-            # AMP Discriminator step (每 disc_update_decimation 个 mini-batch 更新一次)
             # Discriminator loss
-            policy_state, policy_next_state = sample_amp_policy
-            expert_state, expert_next_state = sample_amp_expert
+            if self.policy.amp_discriminator is not None:
+                policy_state, policy_next_state = sample_amp_policy
+                expert_state, expert_next_state = sample_amp_expert
 
-            # if self.amp_normalizer is not None:
-            #     self.amp_normalizer.update(policy_state.cpu().numpy())
-            #     self.amp_normalizer.update(expert_state.cpu().numpy())
-            # if self.amp_normalizer is not None:
-            #     with torch.no_grad():
-            #         policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
-            #         policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
-            #         expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
-            #         expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
+                # if self.amp_normalizer is not None:
+                #     self.amp_normalizer.update(policy_state.cpu().numpy())
+                #     self.amp_normalizer.update(expert_state.cpu().numpy())
+                # if self.amp_normalizer is not None:
+                #     with torch.no_grad():
+                #         policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
+                #         policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
+                #         expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
+                #         expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
 
-            policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
-            expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
-            expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
-            policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
-            amp_loss = 0.5 * (expert_loss + policy_loss)
-            grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10.0)
+                policy_d = self.policy.amp_discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
+                expert_d = self.policy.amp_discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+                expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
+                policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
+                amp_loss = 0.5 * (expert_loss + policy_loss)
+                grad_pen_loss = self.policy.amp_discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10.0)
 
-            # 判别器的总损失
-            self.amploss_coef=1.0
-            discriminator_loss = self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
+                # 判别器的总损失
+                self.amploss_coef=1.0
+                discriminator_loss = self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
 
-            # 更新判别器
-            self.discriminator_optimizer.zero_grad()
-            discriminator_loss.backward()
-            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
-            self.discriminator_optimizer.step()
+                # 更新判别器
+                self.discriminator_optimizer.zero_grad()
+                discriminator_loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.amp_discriminator.parameters(), self.max_grad_norm)
+                self.discriminator_optimizer.step()
 
-            # Store the losses
-            mean_amp_loss += amp_loss.item()
-            mean_grad_pen_loss += grad_pen_loss.item()
-            mean_policy_pred += policy_d.mean().item()
-            mean_expert_pred += expert_d.mean().item()
+                # Store the losses
+                mean_amp_loss += amp_loss.item()
+                mean_grad_pen_loss += grad_pen_loss.item()
+                mean_policy_pred += policy_d.mean().item()
+                mean_expert_pred += expert_d.mean().item()
 
 
             # Surrogate loss

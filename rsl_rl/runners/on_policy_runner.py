@@ -501,33 +501,43 @@ class OnPolicyRunner:
 
         
 
-        amp_data = AMPLoader(
-            self.device,
-            time_between_frames=self.env.unwrapped.step_dt,
-            preload_transitions=True,
-            num_preload_transitions=self.cfg["amp_cfg"]["num_preload_transitions"],
-            motion_files=self.cfg["amp_cfg"]["amp_motion_files"],
-        )
+        
 
-        amp_normalizer = Normalizer(amp_data.observation_dim)
+        
 
-        discriminator = Discriminator(
-            amp_data.observation_dim * 2,
-            self.cfg["amp_cfg"]["reward_coef"],
-            self.cfg["amp_cfg"]["discr_hidden_dims"],
-            self.device,
-            self.cfg["amp_cfg"]["task_reward_lerp"],
-        ).to(self.device)
+        # 如果使用了AMP
+        if self.cfg.get("amp_cfg", False):
+            # 初始化专家数据加载器
+            amp_expert_data = AMPLoader(
+                self.device,
+                time_between_frames=self.env.unwrapped.step_dt,
+                preload_transitions=True,
+                num_preload_transitions=self.cfg["amp_cfg"]["num_preload_transitions"],
+                motion_files=self.cfg["amp_cfg"]["amp_motion_files"],
+            )
+            # 初始化判别器网络
+            amp_discriminator = Discriminator(
+                amp_expert_data.observation_dim * 2,
+                self.cfg["amp_cfg"]["reward_coef"],
+                self.cfg["amp_cfg"]["discr_hidden_dims"],
+                self.device,
+                self.cfg["amp_cfg"]["task_reward_lerp"],
+            ).to(self.device)
+            # 将 amp_data和discriminator 作为成员变量添加到 actor_critic 对象
+            actor_critic.amp_discriminator = amp_discriminator
+            actor_critic.amp_expert_data = amp_expert_data
+
+
+        amp_normalizer = Normalizer(amp_expert_data.observation_dim)
+
+        
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
         alg: PPO = alg_class(
             actor_critic, 
             device=self.device, 
-            amp_data=amp_data,
             train_cfg=self.cfg,
-            amp_normalizer=amp_normalizer,
-            discriminator=discriminator,
             **self.alg_cfg, 
             multi_gpu_cfg=self.multi_gpu_cfg
         )

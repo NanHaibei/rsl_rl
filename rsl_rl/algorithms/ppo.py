@@ -280,15 +280,7 @@ class PPO:
         mean_grad_pen_loss = 0
         mean_policy_pred = 0
         mean_expert_pred = 0
-        # mean_amp_loss = 0 if self.policy.amp_discriminator else None
-        # mean_disc_acc = 0 if self.policy.amp_discriminator else None
-        # mean_expert_loss = 0 if self.policy.amp_discriminator else None
-        # mean_policy_loss = 0 if self.policy.amp_discriminator else None
-        # # -- AMP discriminator output statistics
-        # mean_policy_d_mean = 0 if self.policy.amp_discriminator else None
-        # mean_policy_d_std = 0 if self.policy.amp_discriminator else None
-        # mean_expert_d_mean = 0 if self.policy.amp_discriminator else None
-        # mean_expert_d_std = 0 if self.policy.amp_discriminator else None
+
         disc_actual_updates = 0  # 记录判别器实际更新的次数
 
         # Get mini batch generator
@@ -298,14 +290,21 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # --------- amp ---------
-        amp_policy_generator = self.amp_storage.feed_forward_generator(
-            self.num_learning_epochs * self.num_mini_batches,
-            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
-        )
-        amp_expert_generator = self.policy.amp_expert_data.feed_forward_generator(
-            self.num_learning_epochs * self.num_mini_batches,
-            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
-        )
+        # 只在使用AMP时创建额外的生成器
+        if self.policy.amp_discriminator is not None:
+            amp_policy_generator = self.amp_storage.feed_forward_generator(
+                self.num_learning_epochs * self.num_mini_batches,
+                self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
+            )
+            amp_expert_generator = self.policy.amp_expert_data.feed_forward_generator(
+                self.num_learning_epochs * self.num_mini_batches,
+                self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
+            )
+            # 使用zip同时遍历三个生成器
+            combined_generator = zip(generator, amp_policy_generator, amp_expert_generator)
+        else:
+            # 不使用AMP时,只包装generator以保持统一的接口
+            combined_generator = ((sample, None, None) for sample in generator)
         # --------- amp ---------
 
         # Iterate over batches
@@ -323,7 +322,7 @@ class PPO:
         #     next_observations_batch
         # ) in generator:
         # 从环境采样的数据 + AMP 策略样本 + AMP 专家样本 同时取出一批
-        for sample, sample_amp_policy, sample_amp_expert in zip(generator, amp_policy_generator, amp_expert_generator):
+        for sample, sample_amp_policy, sample_amp_expert in combined_generator:
             (
                 obs_batch,
                 actions_batch,
@@ -340,9 +339,6 @@ class PPO:
 
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
-
-            # 保存原始的 obs_batch 用于 AMP discriminator（在对称增强之前）
-            # obs_batch_original = obs_batch.clone()
 
             # Check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -456,28 +452,30 @@ class PPO:
                 self.encoder_optimizer.step()
 
             # Discriminator loss
-            if self.policy.amp_discriminator is not None:
+            # 根据 disc_update_decimation 控制判别器更新频率，提前判断避免不必要的计算
+            if self.policy.amp_discriminator is not None and (self.disc_update_counter % self.disc_update_decimation == 0):
+                # 获取amp的policy和expert数据
                 policy_state, policy_next_state = sample_amp_policy
                 expert_state, expert_next_state = sample_amp_expert
+                # 如果使用了AMP归一化器
+                if self.policy.amp_discriminator.normalizer is not None:
+                    # 更新归一化器的参数
+                    self.policy.amp_discriminator.normalizer.update(policy_state.cpu().numpy())
+                    self.policy.amp_discriminator.normalizer.update(expert_state.cpu().numpy())
+                    # 对数据进行归一化
+                    with torch.no_grad():
+                        policy_state = self.policy.amp_discriminator.normalizer.normalize_torch(policy_state, self.device)
+                        policy_next_state = self.policy.amp_discriminator.normalizer.normalize_torch(policy_next_state, self.device)
+                        expert_state = self.policy.amp_discriminator.normalizer.normalize_torch(expert_state, self.device)
+                        expert_next_state = self.policy.amp_discriminator.normalizer.normalize_torch(expert_next_state, self.device)
 
-                # if self.amp_normalizer is not None:
-                #     self.amp_normalizer.update(policy_state.cpu().numpy())
-                #     self.amp_normalizer.update(expert_state.cpu().numpy())
-                # if self.amp_normalizer is not None:
-                #     with torch.no_grad():
-                #         policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
-                #         policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
-                #         expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
-                #         expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
-
+                # 计算AMP损失
                 policy_d = self.policy.amp_discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
                 expert_d = self.policy.amp_discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
                 expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
                 policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
                 amp_loss = 0.5 * (expert_loss + policy_loss)
                 grad_pen_loss = self.policy.amp_discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10.0)
-
-                # 判别器的总损失
                 self.amploss_coef=1.0
                 discriminator_loss = self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
 
@@ -486,12 +484,17 @@ class PPO:
                 discriminator_loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.amp_discriminator.parameters(), self.max_grad_norm)
                 self.discriminator_optimizer.step()
+                disc_actual_updates += 1  # 记录实际更新次数
 
                 # Store the losses
                 mean_amp_loss += amp_loss.item()
                 mean_grad_pen_loss += grad_pen_loss.item()
                 mean_policy_pred += policy_d.mean().item()
                 mean_expert_pred += expert_d.mean().item()
+
+            # 更新计数器（无论是否更新判别器都要更新）
+            if self.policy.amp_discriminator is not None:
+                self.disc_update_counter += 1
 
 
             # Surrogate loss
@@ -625,12 +628,14 @@ class PPO:
             mean_dkl_loss /= num_updates
         if mean_dwaq_loss is not None:
             mean_dwaq_loss /= num_updates
-        # -- For AMP (使用实际更新次数进行平均)
+        # -- For AMP (使用实际更新次数进行平均，如果没有更新则除以num_updates)
         if mean_amp_loss:
-            mean_amp_loss /= num_updates
-            mean_grad_pen_loss /= num_updates
-            mean_policy_pred /= num_updates
-            mean_expert_pred /= num_updates
+            # 如果判别器有实际更新，使用实际更新次数；否则使用总批次数
+            amp_divisor = disc_actual_updates if disc_actual_updates > 0 else num_updates
+            mean_amp_loss /= amp_divisor
+            mean_grad_pen_loss /= amp_divisor
+            mean_policy_pred /= amp_divisor
+            mean_expert_pred /= amp_divisor
         # Clear the storage
         self.storage.clear()
 
@@ -654,16 +659,6 @@ class PPO:
             loss_dict["obs_loss"] = mean_obs_loss
             loss_dict["dkl_loss"] = mean_dkl_loss
             loss_dict["dwaq_loss"] = mean_dwaq_loss
-        # if self.policy.amp_discriminator:
-        #     loss_dict["amp_loss"] = mean_amp_loss
-        #     loss_dict["disc_acc"] = mean_disc_acc
-        #     loss_dict["expert_loss"] = mean_expert_loss
-        #     loss_dict["policy_loss"] = mean_policy_loss
-        #     loss_dict["disc_updates"] = disc_actual_updates
-        #     loss_dict["policy_d_mean"] = mean_policy_d_mean
-        #     loss_dict["policy_d_std"] = mean_policy_d_std
-        #     loss_dict["expert_d_mean"] = mean_expert_d_mean
-        #     loss_dict["expert_d_std"] = mean_expert_d_std
 
         return loss_dict
 

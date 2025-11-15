@@ -19,7 +19,7 @@
 import torch
 import torch.nn as nn
 from torch import autograd
-
+from rsl_rl.utils import Normalizer
 
 class Discriminator(nn.Module):
     """
@@ -39,7 +39,7 @@ class Discriminator(nn.Module):
         task_reward_lerp (float): Interpolation factor for combining rewards.
     """
 
-    def __init__(self, input_dim, amp_reward_coef, hidden_layer_sizes, device, task_reward_lerp=0.0):
+    def __init__(self, input_dim, amp_reward_coef, hidden_layer_sizes, device, normalize, task_reward_lerp=0.0):
         super().__init__()
 
         self.device = device
@@ -59,6 +59,8 @@ class Discriminator(nn.Module):
         self.amp_linear.train()
 
         self.task_reward_lerp = task_reward_lerp
+        
+        self.normalizer = Normalizer(int(input_dim/2)) if normalize else None
 
     def forward(self, x):
         """
@@ -99,7 +101,7 @@ class Discriminator(nn.Module):
         grad_pen = lambda_ * (grad.norm(2, dim=1) - 0).pow(2).mean()
         return grad_pen
 
-    def predict_amp_reward(self, state, next_state, task_reward, normalizer=None):
+    def predict_amp_reward(self, state, next_state, task_reward):
         """
         Predict the AMP reward given current and next states, optionally interpolated with a task reward.
 
@@ -107,7 +109,6 @@ class Discriminator(nn.Module):
             state (torch.Tensor): Current state tensor.
             next_state (torch.Tensor): Next state tensor.
             task_reward (torch.Tensor): Task-specific reward tensor.
-            normalizer (optional): Normalizer object to normalize input states before prediction.
 
         Returns:
             tuple:
@@ -116,9 +117,9 @@ class Discriminator(nn.Module):
         """
         with torch.no_grad():
             self.eval()
-            if normalizer is not None:
-                state = normalizer.normalize_torch(state, self.device)
-                next_state = normalizer.normalize_torch(next_state, self.device)
+            if self.normalizer is not None:
+                state = self.normalizer.normalize_torch(state, self.device)
+                next_state = self.normalizer.normalize_torch(next_state, self.device)
 
             d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
             style_reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)

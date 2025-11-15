@@ -486,26 +486,6 @@ class OnPolicyRunner:
         ).to(self.device)
 
         # 如果使用了AMP
-        # if self.cfg.get("amp_cfg", False):
-        #     # 初始化判别器网络
-        #     amp_discriminator = AMPDiscriminator(
-        #         obs["amp_policy"].shape[-1] * 2,  # 当前帧 + 下一帧
-        #         self.cfg["amp_cfg"]["reward_coef"],
-        #         self.cfg["amp_cfg"]["discr_hidden_dims"],
-        #         self.device,
-        #         self.cfg["amp_cfg"]["task_reward_lerp"],
-        #         self.cfg["amp_cfg"].get("discr_nomalize", True),  # 默认使用归一化
-        #     ).to(self.device)
-        #     # 将 discriminator 作为成员变量添加到 actor_critic 对象
-        #     actor_critic.amp_discriminator = amp_discriminator
-
-        
-
-        
-
-        
-
-        # 如果使用了AMP
         if self.cfg.get("amp_cfg", False):
             # 初始化专家数据加载器
             amp_expert_data = AMPLoader(
@@ -517,20 +497,17 @@ class OnPolicyRunner:
             )
             # 初始化判别器网络
             amp_discriminator = Discriminator(
-                amp_expert_data.observation_dim * 2,
-                self.cfg["amp_cfg"]["reward_coef"],
-                self.cfg["amp_cfg"]["discr_hidden_dims"],
-                self.device,
-                self.cfg["amp_cfg"]["task_reward_lerp"],
+                input_dim=amp_expert_data.observation_dim * 2,
+                amp_reward_coef=self.cfg["amp_cfg"]["reward_coef"],
+                hidden_layer_sizes=self.cfg["amp_cfg"]["discr_hidden_dims"],
+                device=self.device,
+                normalize=self.cfg["amp_cfg"]["discr_normalize"],
+                task_reward_lerp=self.cfg["amp_cfg"]["task_reward_lerp"],
             ).to(self.device)
             # 将 amp_data和discriminator 作为成员变量添加到 actor_critic 对象
             actor_critic.amp_discriminator = amp_discriminator
             actor_critic.amp_expert_data = amp_expert_data
 
-
-        amp_normalizer = Normalizer(amp_expert_data.observation_dim)
-
-        
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))

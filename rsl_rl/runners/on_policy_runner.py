@@ -23,7 +23,6 @@ from rsl_rl.modules import (
     ActorCriticDWAQ,
     # ActorCritic_DeltaSine,
     AMPDiscriminator,
-    Discriminator,
     resolve_rnd_config,
     resolve_symmetry_config
 )
@@ -496,7 +495,7 @@ class OnPolicyRunner:
                 motion_files=self.cfg["amp_cfg"]["amp_motion_files"],
             )
             # 初始化判别器网络
-            amp_discriminator = Discriminator(
+            amp_discriminator = AMPDiscriminator(
                 input_dim=amp_expert_data.observation_dim * 2,
                 amp_reward_coef=self.cfg["amp_cfg"]["reward_coef"],
                 hidden_layer_sizes=self.cfg["amp_cfg"]["discr_hidden_dims"],

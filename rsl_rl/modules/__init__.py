@@ -15,7 +15,6 @@ from .symmetry import resolve_symmetry_config
 from .actor_critic_EstNet import ActorCriticEstNet
 from .actor_critic_DWAQ import ActorCriticDWAQ
 from .amp_discriminator import AMPDiscriminator
-from .discriminator import Discriminator
 
 __all__ = [
     "ActorCritic",
@@ -29,5 +28,4 @@ __all__ = [
     "ActorCriticEstNet",
     "ActorCriticDWAQ",
     "AMPDiscriminator",
-    "Discriminator",
 ]

@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 from torch import autograd
 from rsl_rl.utils import Normalizer
-from rsl_rl.networks import MLP, EmpiricalNormalization
 
 class AMPDiscriminator(nn.Module):
     """
@@ -40,68 +39,42 @@ class AMPDiscriminator(nn.Module):
         task_reward_lerp (float): Interpolation factor for combining rewards.
     """
 
-    def __init__(self, input_dim, amp_reward_coef, hidden_layer_sizes, device, task_reward_lerp=0.0, use_normalize=True):
+    def __init__(self, input_dim, amp_reward_coef, hidden_layer_sizes, device, normalize, task_reward_lerp=0.0):
         super().__init__()
 
         self.device = device
         self.input_dim = input_dim
 
         self.amp_reward_coef = amp_reward_coef
-        # amp_layers = []
-        # curr_in_dim = input_dim
-        # for hidden_dim in hidden_layer_sizes:
-        #     amp_layers.append(nn.Linear(curr_in_dim, hidden_dim))
-        #     amp_layers.append(nn.ReLU())
-        #     curr_in_dim = hidden_dim
-        # self.trunk = nn.Sequential(*amp_layers).to(device)
-        # self.amp_linear = nn.Linear(hidden_layer_sizes[-1], 1).to(device)
+        amp_layers = []
+        curr_in_dim = input_dim
+        for hidden_dim in hidden_layer_sizes:
+            amp_layers.append(nn.Linear(curr_in_dim, hidden_dim))
+            amp_layers.append(nn.ReLU())
+            curr_in_dim = hidden_dim
+        self.trunk = nn.Sequential(*amp_layers).to(device)
+        self.amp_linear = nn.Linear(hidden_layer_sizes[-1], 1).to(device)
 
-        # self.trunk.train()
-        # self.amp_linear.train()
-
-        self.net = MLP(input_dim, 1, hidden_layer_sizes).to(device).train()
-
-        print(f"Discriminator: {self.net}")
+        self.trunk.train()
+        self.amp_linear.train()
 
         self.task_reward_lerp = task_reward_lerp
-        self.use_normalize = use_normalize
-        if self.use_normalize:
-            self.normalizer = EmpiricalNormalization(int(input_dim / 2))
-            print("Discriminator: Using input normalization")
-        else:
-            self.normalizer = None
-            print("Discriminator: Normalization disabled")
+        
+        self.normalizer = Normalizer(int(input_dim/2)) if normalize else None
 
-    def forward(self, now_state, next_state, update_normalizer=True):
+    def forward(self, x):
         """
-        推理判别器
-        
+        Forward pass through the discriminator network.
+
         Args:
-            now_state (torch.Tensor): 当前状态观测
-            next_state (torch.Tensor): 下一状态观测
-            update_normalizer (bool): 是否更新归一化器统计量。
-                                     对于策略数据应该设为 True，
-                                     对于专家数据应该设为 False。
+            x (torch.Tensor): Input tensor with shape (batch_size, input_dim).
+
+        Returns:
+            torch.Tensor: Discriminator output logits with shape (batch_size, 1).
         """
-        # h = self.trunk(x)
-        # d = self.amp_linear(h)
-        
-        # 如果使用归一化
-        if self.use_normalize:
-            # 只在明确要求且处于训练模式时更新归一化器参数
-            # 策略数据应该更新 normalizer，专家数据不应该更新
-            if update_normalizer and self.training:
-                self.normalizer.update(now_state)
-                self.normalizer.update(next_state)
-            
-            # 执行归一化
-            now_state = self.normalizer(now_state)
-            next_state = self.normalizer(next_state)
-        
-        # 拼接当前帧与下一帧
-        input = torch.cat([now_state, next_state], dim=-1)
-        # 推理并返回
-        return self.net(input)
+        h = self.trunk(x)
+        d = self.amp_linear(h)
+        return d
 
     def compute_grad_pen(self, expert_state, expert_next_state, lambda_=10):
         """
@@ -115,30 +88,13 @@ class AMPDiscriminator(nn.Module):
         Returns:
             torch.Tensor: Scalar gradient penalty loss.
         """
-        
-        # 如果使用归一化，手动归一化（不更新 normalizer 统计量）
-        if self.use_normalize:
-            with torch.no_grad():
-                expert_state_norm = self.normalizer(expert_state)
-                expert_next_state_norm = self.normalizer(expert_next_state)
-                # 拼接归一化后的数据
-                expert_data = torch.cat([expert_state_norm, expert_next_state_norm], dim=-1)
-        else:
-            # 不使用归一化，直接拼接
-            expert_data = torch.cat([expert_state, expert_next_state], dim=-1)
-        
-        # 对拼接后的数据启用梯度追踪（用于梯度惩罚计算）
-        expert_data = expert_data.detach().requires_grad_(True)
-        
-        # 直接通过网络（跳过 forward 方法，避免重复归一化）
-        disc = self.net(expert_data)
-        
+        expert_data = torch.cat([expert_state, expert_next_state], dim=-1)
+        expert_data.requires_grad = True
+
+        disc = self.amp_linear(self.trunk(expert_data))
         ones = torch.ones(disc.size(), device=disc.device)
-        
-        # 对拼接后的数据计算梯度
         grad = autograd.grad(
-            outputs=disc, inputs=expert_data, grad_outputs=ones, 
-            create_graph=True, retain_graph=True, only_inputs=True
+            outputs=disc, inputs=expert_data, grad_outputs=ones, create_graph=True, retain_graph=True, only_inputs=True
         )[0]
 
         # Enforce that the grad norm approaches 0.
@@ -161,16 +117,16 @@ class AMPDiscriminator(nn.Module):
         """
         with torch.no_grad():
             self.eval()
+            if self.normalizer is not None:
+                state = self.normalizer.normalize_torch(state, self.device)
+                next_state = self.normalizer.normalize_torch(next_state, self.device)
 
-            # 调用 forward 方法，但不更新 normalizer（推理阶段不应更新统计量）
-            d = self.forward(state, next_state, update_normalizer=False)
+            d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
             style_reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
             if self.task_reward_lerp > 0:
-                final_reward = self._lerp_reward(style_reward, task_reward.unsqueeze(-1))
-            else:
-                final_reward = style_reward
+                final_reward, disc_r, task_r= self._lerp_reward(style_reward, task_reward.unsqueeze(-1))
             self.train()
-        return final_reward.squeeze(), style_reward.squeeze(), d
+        return final_reward.squeeze(), style_reward.squeeze(), d, disc_r.squeeze(), task_r.squeeze()
 
     def _lerp_reward(self, disc_r, task_r):
         """
@@ -184,4 +140,6 @@ class AMPDiscriminator(nn.Module):
             torch.Tensor: Interpolated reward.
         """
         r = (1.0 - self.task_reward_lerp) * disc_r + self.task_reward_lerp * task_r
-        return r
+        disc_r = (1.0 - self.task_reward_lerp) * disc_r
+        task_r = self.task_reward_lerp * task_r
+        return r, disc_r, task_r

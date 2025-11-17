@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, Discriminator
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -139,7 +139,7 @@ class PPO:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         # AMP Discriminator
-        if self.policy.amp_discriminator is not None:
+        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
             amp_cfg = train_cfg["amp_cfg"]
             self.amp_storage = ReplayBuffer(self.policy.amp_discriminator.input_dim // 2, 100000, device)
 
@@ -210,7 +210,7 @@ class PPO:
             self.rnd.update_normalization(obs)
 
         # 如果使用了AMP则重新计算奖励
-        if self.policy.amp_discriminator is not None:
+        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
             # 保存原始 task reward
             self.task_rewards = rewards.clone()
             
@@ -225,6 +225,8 @@ class PPO:
             
             # 使用 final reward 作为最终奖励
             rewards = self.final_rewards
+            # 保存amp policy观测值
+            self.amp_storage.insert(amp_obs, next_amp_obs)
         else:
             self.task_rewards = None
             self.style_rewards = None
@@ -249,7 +251,6 @@ class PPO:
             )
 
         # Record the transition
-        self.amp_storage.insert(amp_obs, next_amp_obs)
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
@@ -289,9 +290,8 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # --------- amp ---------
         # 只在使用AMP时创建额外的生成器
-        if self.policy.amp_discriminator is not None:
+        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
             amp_policy_generator = self.amp_storage.feed_forward_generator(
                 self.num_learning_epochs * self.num_mini_batches,
                 self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches,
@@ -305,22 +305,7 @@ class PPO:
         else:
             # 不使用AMP时,只包装generator以保持统一的接口
             combined_generator = ((sample, None, None) for sample in generator)
-        # --------- amp ---------
 
-        # Iterate over batches
-        # for (
-        #     obs_batch,
-        #     actions_batch,
-        #     target_values_batch,
-        #     advantages_batch,
-        #     returns_batch,
-        #     old_actions_log_prob_batch,
-        #     old_mu_batch,
-        #     old_sigma_batch,
-        #     hidden_states_batch,
-        #     masks_batch,
-        #     next_observations_batch
-        # ) in generator:
         # 从环境采样的数据 + AMP 策略样本 + AMP 专家样本 同时取出一批
         for sample, sample_amp_policy, sample_amp_expert in combined_generator:
             (
@@ -453,7 +438,7 @@ class PPO:
 
             # Discriminator loss
             # 根据 disc_update_decimation 控制判别器更新频率，提前判断避免不必要的计算
-            if self.policy.amp_discriminator is not None and (self.disc_update_counter % self.disc_update_decimation == 0):
+            if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None and (self.disc_update_counter % self.disc_update_decimation == 0):
                 # 获取amp的policy和expert数据
                 policy_state, policy_next_state = sample_amp_policy
                 expert_state, expert_next_state = sample_amp_expert
@@ -493,7 +478,7 @@ class PPO:
                 mean_expert_pred += expert_d.mean().item()
 
             # 更新计数器（无论是否更新判别器都要更新）
-            if self.policy.amp_discriminator is not None:
+            if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
                 self.disc_update_counter += 1
 
 

@@ -225,10 +225,10 @@ class ActorCriticDWAQ(nn.Module):
         obs = self.actor_obs_normalizer(obs)
         code,vel_sample,_,_,_,_,_ = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((code.detach(),now_obs),dim=-1)
+        observation = torch.cat((code.detach(),now_obs),dim=-1) # TODO:应该使用均值而不是采样值
         self._update_distribution(observation)
         # 记录速度估计值
-        self.extra_info["est_vel"] = vel_sample
+        self.extra_info["est_vel"] = vel_sample # TODO:应该使用均值而不是采样值
         return self.distribution.sample(), self.extra_info
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
@@ -236,9 +236,9 @@ class ActorCriticDWAQ(nn.Module):
         obs = self.actor_obs_normalizer(obs)
         code,vel_sample,_,_,_,_,_ = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((code.detach(),now_obs),dim=-1)
+        observation = torch.cat((code.detach(),now_obs),dim=-1)# TODO:应该使用均值而不是采样值
         # 记录速度估计值
-        self.extra_info["est_vel"] = vel_sample
+        self.extra_info["est_vel"] = vel_sample # TODO:应该使用均值而不是采样值
         if self.state_dependent_std:
             return self.actor(observation)[..., 0, :], self.extra_info
         else:

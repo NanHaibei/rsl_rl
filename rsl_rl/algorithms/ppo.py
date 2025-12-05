@@ -412,7 +412,7 @@ class PPO:
                 grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
                 self.encoder_optimizer.step()
 
-            # DWAQ step
+            # DWAQ step TODO:使用vel_mean计算MSE、仅使用zt计算KL散度
             if self.dwaq:
                 policy_obs = self.policy.get_actor_obs(obs_batch)
                 policy_obs = self.policy.actor_obs_normalizer(policy_obs)
@@ -425,8 +425,8 @@ class PPO:
                 vel_target.requires_grad = False
                 obs_target.requires_grad = False
                 # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
-                vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 10.0
-                obs_MSE = nn.MSELoss()(decode, obs_target) * 10.0
+                vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 10.0 # TODO:应该使用均值而不是采样值
+                obs_MSE = nn.MSELoss()(decode, obs_target) * 10.0 # TODO:应该使用均值而不是采样值
                 # KL散度损失：按批次平均
                 dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
                 autoenc_loss = vel_MSE + obs_MSE + self.policy.beta * dkl_loss 
@@ -629,10 +629,6 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
-            "amp": mean_amp_loss,
-            "amp_grad_pen": mean_grad_pen_loss,
-            "amp_policy_pred": mean_policy_pred,
-            "amp_expert_pred": mean_expert_pred,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -644,6 +640,11 @@ class PPO:
             loss_dict["obs_loss"] = mean_obs_loss
             loss_dict["dkl_loss"] = mean_dkl_loss
             loss_dict["dwaq_loss"] = mean_dwaq_loss
+        if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
+            loss_dict["amp"] = mean_amp_loss
+            loss_dict["amp_grad_pen"] = mean_grad_pen_loss
+            loss_dict["amp_policy_pred"] = mean_policy_pred
+            loss_dict["amp_expert_pred"] = mean_expert_pred
 
         return loss_dict
 

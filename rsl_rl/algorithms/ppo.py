@@ -420,7 +420,7 @@ class PPO:
                 vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
                 next_observations = self.policy.get_actor_obs(next_observations_batch)
                 next_observations = self.policy.actor_obs_normalizer(next_observations)
-                obs_target = next_observations[:, 0:self.policy.obs_one_frame_len]  # 取最新一帧obs
+                obs_target = next_observations[:, 0:self.policy.num_decoder]  # 取最新一帧obs
                 
                 vel_target.requires_grad = False
                 obs_target.requires_grad = False

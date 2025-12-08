@@ -32,6 +32,7 @@ class ActorCriticDWAQ(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
+        num_decode: int = 30,
         num_latent: int = 19,
         num_history_len: int = 5,
         VAE_beta: float = 1.0,
@@ -66,6 +67,8 @@ class ActorCriticDWAQ(nn.Module):
         self.num_history_len = num_history_len
         # 单帧obs长度
         self.obs_one_frame_len: int = int(num_actor_obs / num_history_len)
+        # 记录decoder输出的维度
+        self.num_decoder = num_decode
 
         # Actor
         if self.state_dependent_std:
@@ -105,7 +108,7 @@ class ActorCriticDWAQ(nn.Module):
         print(f"Encoder velocity logvar: {self.encoder_vel_logvar}")
 
         # Decoder
-        self.decoder = MLP(num_latent, self.obs_one_frame_len, decoder_hidden_dims, activation)
+        self.decoder = MLP(num_latent, num_decode, decoder_hidden_dims, activation)
         print(f"Decoder MLP: {self.decoder}")
 
         # Action noise
@@ -223,22 +226,24 @@ class ActorCriticDWAQ(nn.Module):
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        code,vel_sample,_,_,_,_,_ = self.encoder_forward(obs)
+        code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((code.detach(),now_obs),dim=-1) # TODO:应该使用均值而不是采样值
+        observation = torch.cat((code.detach(),now_obs),dim=-1)
         self._update_distribution(observation)
         # 记录速度估计值
-        self.extra_info["est_vel"] = vel_sample # TODO:应该使用均值而不是采样值
+        self.extra_info["est_vel"] = vel_mean 
+        self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decoder] + 1e-2) + self.actor_obs_normalizer.mean[:self.num_decoder]  # 返回反归一化后的预测观测值
         return self.distribution.sample(), self.extra_info
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        code,vel_sample,_,_,_,_,_ = self.encoder_forward(obs)
+        code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((code.detach(),now_obs),dim=-1)# TODO:应该使用均值而不是采样值
+        observation = torch.cat((vel_mean.detach(), latent_mean.detach(), now_obs),dim=-1)
         # 记录速度估计值
-        self.extra_info["est_vel"] = vel_sample # TODO:应该使用均值而不是采样值
+        self.extra_info["est_vel"] = vel_mean 
+        self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decoder] + 1e-2) + self.actor_obs_normalizer.mean[:self.num_decoder]  # 返回反归一化后的预测观测值
         if self.state_dependent_std:
             return self.actor(observation)[..., 0, :], self.extra_info
         else:

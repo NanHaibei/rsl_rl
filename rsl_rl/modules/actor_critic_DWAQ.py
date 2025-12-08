@@ -227,29 +227,27 @@ class ActorCriticDWAQ(nn.Module):
         return code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
-        obs = self.get_actor_obs(obs)
-        obs = self.actor_obs_normalizer(obs)
-        code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
-        now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
+        actor_obs = self.get_actor_obs(obs)
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(actor_obs)
+        now_obs = actor_obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
         
-        if self.use_adaboot:  # 如果使用adaboot
-            # 计算概率
-            reward = kwargs.get("rewards", None)
+        # 根据条件决定是否使用adaboot
+        reward = kwargs.get("rewards", None)
+        if self.use_adaboot and reward is not None:
+            # 计算adaboot概率
             CV_R = torch.std(reward) / (torch.mean(reward) + 1e-8)
             p_boot = 1 - torch.tanh(CV_R)
-            # 获取真实线速度
+            # 获取真实线速度（使用原始obs）
             critic_obs = self.get_critic_obs(obs)
             critic_obs = self.critic_obs_normalizer(critic_obs)
             real_lin_vel = critic_obs[:, 0:3]  # 取前3维作为真实线速度
-            # 选择使用估计速度还是使用真实速度
+            # 按概率选择使用估计速度还是真实速度
             use_estimated = torch.rand(1, device=vel_sample.device).item() < p_boot
-            if use_estimated:
-                selected_vel = vel_sample
-            else:
-                selected_vel = real_lin_vel
-            # 送给policy
+            selected_vel = vel_sample if use_estimated else real_lin_vel
             observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
         else:
+            # 不使用adaboot或在更新阶段，直接使用code
             observation = torch.cat((code.detach(), now_obs), dim=-1)
         
         self._update_distribution(observation)

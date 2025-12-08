@@ -245,7 +245,8 @@ class ActorCriticDWAQ(nn.Module):
             # 按概率选择使用估计速度还是真实速度
             use_estimated = torch.rand(1, device=vel_sample.device).item() < p_boot
             selected_vel = vel_sample if use_estimated else real_lin_vel
-            observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
+            # observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
+            observation = torch.cat((real_lin_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
         else:
             # 不使用adaboot或在更新阶段，直接使用code
             observation = torch.cat((code.detach(), now_obs), dim=-1)
@@ -259,7 +260,7 @@ class ActorCriticDWAQ(nn.Module):
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
+        code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
         observation = torch.cat((vel_mean.detach(), latent_mean.detach(), now_obs),dim=-1)
         # 记录速度估计值

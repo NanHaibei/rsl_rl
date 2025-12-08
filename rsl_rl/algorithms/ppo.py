@@ -402,7 +402,9 @@ class PPO:
                 policy_obs = self.policy.get_actor_obs(obs_batch)
                 policy_obs = self.policy.actor_obs_normalizer(policy_obs)
                 vel_est = self.policy.encoder_forward(policy_obs) 
-                vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
+                critic_obs = self.policy.get_critic_obs(obs_batch)
+                critic_obs = self.policy.critic_obs_normalizer(critic_obs)
+                vel_target = critic_obs[:,0:3]  # 真实速度作为目标
                 vel_target.requires_grad = False
                 vel_MSE = nn.MSELoss()(vel_est, vel_target) * 1000.0 # 小数使用L2loss后太小了，没有梯度
 
@@ -417,7 +419,9 @@ class PPO:
                 policy_obs = self.policy.get_actor_obs(obs_batch)
                 policy_obs = self.policy.actor_obs_normalizer(policy_obs)
                 code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(policy_obs) 
-                vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
+                critic_obs = self.policy.get_critic_obs(obs_batch)
+                critic_obs = self.policy.critic_obs_normalizer(critic_obs)
+                vel_target = critic_obs[:,0:3]  # 真实速度作为目标
                 next_observations = self.policy.get_actor_obs(next_observations_batch)
                 next_observations = self.policy.actor_obs_normalizer(next_observations)
                 obs_target = next_observations[:, 0:self.policy.num_decoder]  # 取最新一帧obs

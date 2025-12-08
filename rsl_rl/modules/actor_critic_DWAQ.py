@@ -36,6 +36,7 @@ class ActorCriticDWAQ(nn.Module):
         num_latent: int = 19,
         num_history_len: int = 5,
         VAE_beta: float = 1.0,
+        use_adaboot: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -69,6 +70,8 @@ class ActorCriticDWAQ(nn.Module):
         self.obs_one_frame_len: int = int(num_actor_obs / num_history_len)
         # 记录decoder输出的维度
         self.num_decoder = num_decode
+        # 是否使用adaboot
+        self.use_adaboot = use_adaboot
 
         # Actor
         if self.state_dependent_std:
@@ -221,14 +224,34 @@ class ActorCriticDWAQ(nn.Module):
         # 解码得到下一时刻观测值
         decode = self.decoder(code)
 
-        return code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar
+        return code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
-        code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
+        code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((code.detach(),now_obs),dim=-1)
+        
+        if self.use_adaboot:  # 如果使用adaboot
+            # 计算概率
+            reward = kwargs.get("rewards", None)
+            CV_R = torch.std(reward) / (torch.mean(reward) + 1e-8)
+            p_boot = 1 - torch.tanh(CV_R)
+            # 获取真实线速度
+            critic_obs = self.get_critic_obs(obs)
+            critic_obs = self.critic_obs_normalizer(critic_obs)
+            real_lin_vel = critic_obs[:, 0:3]  # 取前3维作为真实线速度
+            # 选择使用估计速度还是使用真实速度
+            use_estimated = torch.rand(1, device=vel_sample.device).item() < p_boot
+            if use_estimated:
+                selected_vel = vel_sample
+            else:
+                selected_vel = real_lin_vel
+            # 送给policy
+            observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
+        else:
+            observation = torch.cat((code.detach(), now_obs), dim=-1)
+        
         self._update_distribution(observation)
         # 记录速度估计值
         self.extra_info["est_vel"] = vel_mean 

@@ -187,11 +187,11 @@ class PPO:
             self.device,
         )
 
-    def act(self, obs: TensorDict) -> torch.Tensor:
+    def act(self, obs: TensorDict, rewards) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions, extra_info = self.policy.act(obs)
+        self.transition.actions, extra_info = self.policy.act(obs, rewards=rewards)
         self.transition.actions = self.transition.actions.detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
@@ -416,7 +416,7 @@ class PPO:
             if self.dwaq:
                 policy_obs = self.policy.get_actor_obs(obs_batch)
                 policy_obs = self.policy.actor_obs_normalizer(policy_obs)
-                code,vel_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(policy_obs) 
+                code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(policy_obs) 
                 vel_target = self.policy.get_critic_obs(obs_batch)[:,0:3]
                 next_observations = self.policy.get_actor_obs(next_observations_batch)
                 next_observations = self.policy.actor_obs_normalizer(next_observations)

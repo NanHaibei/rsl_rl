@@ -114,13 +114,15 @@ class OnPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        # 初始化rewards（首次调用act时需要）
+        rewards = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions, extra_info = self.alg.act(obs)
+                    actions, extra_info = self.alg.act(obs, rewards)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device), extra_info)
                     # Move to device

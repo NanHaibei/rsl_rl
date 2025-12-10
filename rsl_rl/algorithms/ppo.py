@@ -429,8 +429,8 @@ class PPO:
                 vel_target.requires_grad = False
                 obs_target.requires_grad = False
                 # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
-                vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 10.0 # TODO:应该使用均值而不是采样值
-                obs_MSE = nn.MSELoss()(decode, obs_target) * 10.0 # TODO:应该使用均值而不是采样值
+                vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 100.0 
+                obs_MSE = nn.MSELoss()(decode, obs_target)
                 # KL散度损失：按批次平均
                 dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
                 autoenc_loss = vel_MSE + obs_MSE + self.policy.beta * dkl_loss 

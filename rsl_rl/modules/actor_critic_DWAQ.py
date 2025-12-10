@@ -245,8 +245,8 @@ class ActorCriticDWAQ(nn.Module):
             # 按概率选择使用估计速度还是真实速度
             use_estimated = torch.rand(1, device=vel_sample.device).item() < p_boot
             selected_vel = vel_sample if use_estimated else real_lin_vel
-            # observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
-            observation = torch.cat((real_lin_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
+            observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
+            # observation = torch.cat((real_lin_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
         else:
             # 不使用adaboot或在更新阶段，直接使用code
             observation = torch.cat((code.detach(), now_obs), dim=-1)

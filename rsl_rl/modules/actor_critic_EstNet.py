@@ -230,3 +230,54 @@ class ActorCriticEstNet(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def update_encoder(
+        self, 
+        obs_batch: TensorDict,
+        next_observations_batch: TensorDict,
+        encoder_optimizer: torch.optim.Optimizer, 
+        max_grad_norm: float
+    ) -> dict[str, float]:
+        """计算编码器损失并更新参数
+        
+        Args:
+            obs_batch: 当前观测批次数据
+            next_observations_batch: 下一时刻观测批次数据（EstNet不使用，但保持接口统一）
+            encoder_optimizer: 编码器优化器
+            max_grad_norm: 梯度裁剪的最大范数
+            
+        Returns:
+            损失字典，包含各项损失值
+        """
+        # 获取并归一化policy观测
+        policy_obs = self.get_actor_obs(obs_batch)
+        policy_obs = self.actor_obs_normalizer(policy_obs)
+        
+        # 前向传播得到速度估计
+        vel_est = self.encoder_forward(policy_obs)
+        
+        # 获取并归一化critic观测，提取真实速度
+        critic_obs = self.get_critic_obs(obs_batch)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
+        vel_target = critic_obs[:, 0:3]  # 真实速度作为目标
+        vel_target.requires_grad = False
+        
+        # 计算MSE损失（放大1000倍以获得更明显的梯度）
+        vel_MSE = nn.MSELoss()(vel_est, vel_target)
+        
+        # 反向传播
+        encoder_optimizer.zero_grad()
+        vel_MSE.backward(retain_graph=True)
+        
+        # 梯度裁剪
+        encoder_params = [p for group in encoder_optimizer.param_groups for p in group['params']]
+        nn.utils.clip_grad_norm_(encoder_params, max_grad_norm)
+        
+        # 更新参数
+        encoder_optimizer.step()
+        
+        # 返回统一格式的损失字典
+        return {
+            "vel_loss": vel_MSE.item(),
+            "total_loss": vel_MSE.item(),
+        }

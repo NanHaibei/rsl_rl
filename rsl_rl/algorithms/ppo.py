@@ -270,12 +270,8 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
-        # -- vel est loss
-        mean_vel_loss = 0 if self.estnet or self.dwaq else None
-        # -- DWAQ loss
-        mean_obs_loss = 0 if self.dwaq else None
-        mean_dkl_loss = 0 if self.dwaq else None
-        mean_dwaq_loss = 0 if self.dwaq else None
+        # -- Encoder losses (动态处理)
+        encoder_losses_dict = {}
         # -- AMP loss
         mean_amp_loss = 0
         mean_grad_pen_loss = 0
@@ -397,48 +393,19 @@ class PPO:
                         for param_group in self.encoder_optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
-            # Estimate Net step
-            if self.estnet:
-                policy_obs = self.policy.get_actor_obs(obs_batch)
-                policy_obs = self.policy.actor_obs_normalizer(policy_obs)
-                vel_est = self.policy.encoder_forward(policy_obs) 
-                critic_obs = self.policy.get_critic_obs(obs_batch)
-                critic_obs = self.policy.critic_obs_normalizer(critic_obs)
-                vel_target = critic_obs[:,0:3]  # 真实速度作为目标
-                vel_target.requires_grad = False
-                vel_MSE = nn.MSELoss()(vel_est, vel_target) * 1000.0 # 小数使用L2loss后太小了，没有梯度
-
-                self.encoder_optimizer.zero_grad()
-                vel_MSE.backward(retain_graph=True)
-                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
-                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)
-                self.encoder_optimizer.step()
-
-            # DWAQ step TODO:使用vel_mean计算MSE、仅使用zt计算KL散度
-            if self.dwaq:
-                policy_obs = self.policy.get_actor_obs(obs_batch)
-                policy_obs = self.policy.actor_obs_normalizer(policy_obs)
-                code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.policy.encoder_forward(policy_obs) 
-                critic_obs = self.policy.get_critic_obs(obs_batch)
-                critic_obs = self.policy.critic_obs_normalizer(critic_obs)
-                vel_target = critic_obs[:,0:3]  # 真实速度作为目标
-                next_observations = self.policy.get_actor_obs(next_observations_batch)
-                next_observations = self.policy.actor_obs_normalizer(next_observations)
-                obs_target = next_observations[:, 0:self.policy.num_decoder]  # 取最新一帧obs
-                
-                vel_target.requires_grad = False
-                obs_target.requires_grad = False
-                # DreamWaQ损失=速度重建损失 + obs重建损失 + KL散度损失
-                vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 100.0 
-                obs_MSE = nn.MSELoss()(decode, obs_target)
-                # KL散度损失：按批次平均
-                dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
-                autoenc_loss = vel_MSE + obs_MSE + self.policy.beta * dkl_loss 
-                self.encoder_optimizer.zero_grad()
-                autoenc_loss.backward(retain_graph=True)
-                encoder_params = [p for group in self.encoder_optimizer.param_groups for p in group['params']]
-                grad_norm = nn.utils.clip_grad_norm_(encoder_params, self.max_grad_norm)  # 使用更小的梯度裁剪阈值
-                self.encoder_optimizer.step()
+            # Encoder update step (统一接口，适用于EstNet和DWAQ)
+            if self.estnet or self.dwaq:
+                encoder_losses = self.policy.update_encoder(
+                    obs_batch, 
+                    next_observations_batch, 
+                    self.encoder_optimizer, 
+                    self.max_grad_norm
+                )
+                # 动态累积encoder损失到字典中
+                for loss_key, loss_value in encoder_losses.items():
+                    if loss_key not in encoder_losses_dict:
+                        encoder_losses_dict[loss_key] = 0.0
+                    encoder_losses_dict[loss_key] += loss_value
 
             # Discriminator loss
             # 根据 disc_update_decimation 控制判别器更新频率，提前判断避免不必要的计算
@@ -584,16 +551,6 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
-            # vel est loss
-            if mean_vel_loss is not None:
-                mean_vel_loss += vel_MSE.item()
-            # DWAQ loss
-            if mean_obs_loss is not None:
-                mean_obs_loss += obs_MSE.item()
-            if mean_dkl_loss is not None:
-                mean_dkl_loss += dkl_loss.item()
-            if mean_dwaq_loss is not None:
-                mean_dwaq_loss += autoenc_loss.item()
             # AMP loss - 已在判别器更新时累积，这里不需要重复累积
 
         # Divide the losses by the number of updates
@@ -605,18 +562,9 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        # -- For vel est
-        if mean_vel_loss is not None:
-            mean_vel_loss /= num_updates
-        # -- For DWAQ
-        if mean_vel_loss is not None:
-            mean_vel_loss /= num_updates
-        if mean_obs_loss is not None:
-            mean_obs_loss /= num_updates
-        if mean_dkl_loss is not None:
-            mean_dkl_loss /= num_updates
-        if mean_dwaq_loss is not None:
-            mean_dwaq_loss /= num_updates
+        # -- For Encoder losses (动态处理)
+        for loss_key in encoder_losses_dict:
+            encoder_losses_dict[loss_key] /= num_updates
         # -- For AMP (使用实际更新次数进行平均，如果没有更新则除以num_updates)
         if mean_amp_loss:
             # 如果判别器有实际更新，使用实际更新次数；否则使用总批次数
@@ -638,12 +586,9 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if self.estnet or self.dwaq:
-            loss_dict["vel_loss"] = mean_vel_loss
-        if self.dwaq:
-            loss_dict["obs_loss"] = mean_obs_loss
-            loss_dict["dkl_loss"] = mean_dkl_loss
-            loss_dict["dwaq_loss"] = mean_dwaq_loss
+        # 动态添加encoder损失到返回字典
+        for loss_key, loss_value in encoder_losses_dict.items():
+            loss_dict[loss_key] = loss_value
         if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
             loss_dict["amp"] = mean_amp_loss
             loss_dict["amp_grad_pen"] = mean_grad_pen_loss

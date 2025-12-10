@@ -309,3 +309,67 @@ class ActorCriticDWAQ(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def update_encoder(
+        self, 
+        obs_batch: TensorDict, 
+        next_observations_batch: TensorDict,
+        encoder_optimizer: torch.optim.Optimizer, 
+        max_grad_norm: float
+    ) -> dict[str, float]:
+        """计算DWAQ编码器损失并更新参数
+        
+        Args:
+            obs_batch: 当前观测批次数据
+            next_observations_batch: 下一时刻观测批次数据
+            encoder_optimizer: 编码器优化器
+            max_grad_norm: 梯度裁剪的最大范数
+            
+        Returns:
+            损失字典，包含各项损失值
+        """
+        # 获取并归一化policy观测
+        policy_obs = self.get_actor_obs(obs_batch)
+        policy_obs = self.actor_obs_normalizer(policy_obs)
+        
+        # 前向传播得到编码器输出
+        code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar = self.encoder_forward(policy_obs)
+        
+        # 获取并归一化critic观测，提取真实速度
+        critic_obs = self.get_critic_obs(obs_batch)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
+        vel_target = critic_obs[:, 0:3]  # 真实速度作为目标
+        
+        # 获取下一时刻观测，提取目标观测
+        next_observations = self.get_actor_obs(next_observations_batch) # TODO：应该使用critic的无噪声观测值才对
+        next_observations = self.actor_obs_normalizer(next_observations)
+        obs_target = next_observations[:, 0:self.num_decoder]  # 取最新一帧obs
+        
+        vel_target.requires_grad = False
+        obs_target.requires_grad = False
+        
+        # DreamWaQ损失 = 速度重建损失 + obs重建损失 + KL散度损失
+        vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 100.0
+        obs_MSE = nn.MSELoss()(decode, obs_target)
+        # KL散度损失：按批次平均
+        dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
+        autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
+        
+        # 反向传播
+        encoder_optimizer.zero_grad()
+        autoenc_loss.backward(retain_graph=True)
+        
+        # 梯度裁剪
+        encoder_params = [p for group in encoder_optimizer.param_groups for p in group['params']]
+        nn.utils.clip_grad_norm_(encoder_params, max_grad_norm)
+        
+        # 更新参数
+        encoder_optimizer.step()
+        
+        # 返回统一格式的损失字典
+        return {
+            "vel_loss": vel_MSE.item(),
+            "obs_loss": obs_MSE.item(),
+            "dkl_loss": dkl_loss.item(),
+            "total_loss": autoenc_loss.item(),
+        }

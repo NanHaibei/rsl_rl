@@ -27,7 +27,7 @@ from rsl_rl.modules import (
     resolve_rnd_config,
     resolve_symmetry_config
 )
-from rsl_rl.utils import resolve_obs_groups, store_code_state, AMPLoader, Normalizer
+from rsl_rl.utils import resolve_obs_groups, store_code_state, AMPLoader
 
 
 class OnPolicyRunner:

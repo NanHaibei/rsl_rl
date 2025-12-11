@@ -15,7 +15,11 @@ from .symmetry import resolve_symmetry_config
 from .actor_critic_EstNet import ActorCriticEstNet
 from .actor_critic_DWAQ import ActorCriticDWAQ
 from .amp_discriminator import AMPDiscriminator
-from .actor_critic_ElevationNet import ActorCriticElevationNet
+
+# ElevationNet: 三个独立的mode实现
+from .actor_critic_ElevationNet_mode1 import ActorCriticElevationNetMode1
+from .actor_critic_ElevationNet_mode2 import ActorCriticElevationNetMode2
+from .actor_critic_ElevationNet_mode3 import ActorCriticElevationNetMode3
 
 __all__ = [
     "ActorCritic",
@@ -29,5 +33,9 @@ __all__ = [
     "ActorCriticEstNet",
     "ActorCriticDWAQ",
     "AMPDiscriminator",
-    "ActorCriticElevationNet"
+    
+    # ElevationNet新的独立实现
+    "ActorCriticElevationNetMode1",
+    "ActorCriticElevationNetMode2",
+    "ActorCriticElevationNetMode3",
 ]

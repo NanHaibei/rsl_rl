@@ -21,13 +21,26 @@ from rsl_rl.modules import (
     ActorCriticRecurrent,
     ActorCriticEstNet,
     ActorCriticDWAQ,
+    ActorCriticElevationNetMode1,
+    ActorCriticElevationNetMode2,
+    ActorCriticElevationNetMode3,
     # ActorCritic_DeltaSine,
-    ActorCriticElevationNet,
     AMPDiscriminator,
     resolve_rnd_config,
     resolve_symmetry_config
 )
 from rsl_rl.utils import resolve_obs_groups, store_code_state, AMPLoader
+
+# 类型别名：支持的所有 ActorCritic 类型
+ActorCriticType = (
+    ActorCritic
+    | ActorCriticRecurrent
+    | ActorCriticEstNet
+    | ActorCriticDWAQ
+    | ActorCriticElevationNetMode1
+    | ActorCriticElevationNetMode2
+    | ActorCriticElevationNetMode3
+)
 
 
 class OnPolicyRunner:
@@ -483,7 +496,7 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNet = actor_critic_class(
+        actor_critic: ActorCriticType = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 

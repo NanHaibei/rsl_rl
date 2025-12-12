@@ -55,7 +55,7 @@ class ActorCriticElevationNetMode3(nn.Module):
         noise_std_type: str = "scalar",
         # 高程图编码器配置
         vision_feature_dim: int = 32,
-        vision_num_frames: int = 5,
+        history_frames: int = 5,
         vision_spatial_size: tuple[int, int] = (25, 17),
         elevation_encoder_hidden_dims: list[int] | None = None,
         # 本体编码器配置
@@ -81,15 +81,18 @@ class ActorCriticElevationNetMode3(nn.Module):
         self.noise_std_type = noise_std_type
         self.beta = VAE_beta
         self.num_decode = num_decode
+        num_actor_obs = 0
+        
         
         # 计算观测维度
         num_actor_obs = sum(obs[g].shape[-1] for g in obs_groups["policy"] if g != "height_scan_history")
         num_critic_obs = sum(obs[g].shape[-1] for g in obs_groups["critic"] if g != "height_scan_history")
+        self.obs_one_frame_len: int = int(num_actor_obs / history_frames)
         
         # 计算高程图展平后的维度
         height, width = vision_spatial_size
         height_map_dim = height * width
-        height_map_input_dim = vision_num_frames * height_map_dim
+        height_map_input_dim = history_frames * height_map_dim
         
         ########################################## Actor ##############################################
         print("\n" + "=" * 80)
@@ -107,7 +110,7 @@ class ActorCriticElevationNetMode3(nn.Module):
         if elevation_encoder_hidden_dims is None:
             elevation_encoder_hidden_dims = [max(height_map_input_dim // 2, vision_feature_dim * 2), vision_feature_dim * 2]
         self.elevation_net = MLP(height_map_input_dim, vision_feature_dim, elevation_encoder_hidden_dims, "elu")
-        print(f"  2. 高程图编码器: {height_map_input_dim} ({vision_num_frames}×{height_map_dim}) -> {elevation_encoder_hidden_dims} -> {vision_feature_dim}")
+        print(f"  2. 高程图编码器: {height_map_input_dim} ({history_frames}×{height_map_dim}) -> {elevation_encoder_hidden_dims} -> {vision_feature_dim}")
         
         # 3. 融合MLP
         fusion_output_dim = encoder_hidden_dims[-1]
@@ -130,9 +133,9 @@ class ActorCriticElevationNetMode3(nn.Module):
         print(f"  5. VAE Decoder: {num_latent} -> {decoder_hidden_dims} -> {num_decode}")
         
         # 6. Actor: 从隐向量+当前本体观测输出动作
-        actor_input_dim = num_latent + num_actor_obs
+        actor_input_dim = num_latent + self.obs_one_frame_len
         self.actor = MLP(actor_input_dim, num_actions, actor_hidden_dims, activation)
-        print(f"  6. Actor MLP: {actor_input_dim} (隐向量{num_latent} + 本体{num_actor_obs}) -> {actor_hidden_dims} -> {num_actions}")
+        print(f"  6. Actor MLP: {actor_input_dim} (隐向量{num_latent} + 本体{self.obs_one_frame_len}) -> {actor_hidden_dims} -> {num_actions}")
 
         # Actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -207,7 +210,7 @@ class ActorCriticElevationNetMode3(nn.Module):
         proprio_features = self.proprio_encoder(proprio_obs)
         
         # 2. 提取高程图特征
-        height_map_sequence = self._extract_height_map_sequence(obs)
+        height_map_sequence = self._extract_height_map_sequence(obs) # TODO: 高程图是否需要归一化
         vision_features = self.elevation_net(height_map_sequence)
         
         # 3. 融合特征
@@ -256,7 +259,8 @@ class ActorCriticElevationNetMode3(nn.Module):
             self.encoder_forward(proprio_obs, obs)
         
         # 3. 将隐向量与当前本体观测拼接
-        observation = torch.cat((code.detach(), proprio_obs), dim=-1)
+        now_obs = proprio_obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
+        observation = torch.cat((code.detach(), now_obs), dim=-1)
         
         # 4. Actor输出动作
         mean = self.actor(observation)
@@ -280,7 +284,8 @@ class ActorCriticElevationNetMode3(nn.Module):
             self.encoder_forward(proprio_obs, obs)
         
         # 3. 推理时使用均值而非采样值
-        observation = torch.cat((vel_mean.detach(), latent_mean.detach(), proprio_obs), dim=-1)
+        now_obs = proprio_obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
+        observation = torch.cat((vel_mean.detach(), latent_mean.detach(), now_obs), dim=-1)
         
         # 4. Actor输出确定性动作
         mean = self.actor(observation)

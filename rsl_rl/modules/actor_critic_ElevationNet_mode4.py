@@ -4,11 +4,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-ActorCriticElevationNetMode4: VAE编码器架构，使用3D CNN处理高程图序列
+ActorCriticElevationNetMode4: VAE编码器架构，使用2D CNN处理高程图序列
 
 网络结构:
     本体 -> 本体编码器MLP -> 特征1
-    高程图序列 -> 3D CNN编码器 -> 特征2
+    高程图序列 -> 2D CNN编码器(历史帧作为通道) -> 特征2
     [特征1 + 特征2] -> 融合MLP -> 编码特征
     编码特征 -> Encoder -> 隐向量(v+z)
     隐向量 -> Decoder -> 重建观测
@@ -27,8 +27,8 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
 import os
 
-class Conv3DEncoder(nn.Module):
-    """3D CNN编码器，用于处理高程图序列"""
+class Conv2DEncoder(nn.Module):
+    """2D CNN编码器，用于处理高程图序列（历史帧作为通道）"""
     
     def __init__(
         self,
@@ -46,20 +46,20 @@ class Conv3DEncoder(nn.Module):
         self.spatial_size = spatial_size
         self.output_dim = output_dim
         
-        # 构建3D卷积层
+        # 构建2D卷积层，历史帧作为通道处理
         layers = []
-        in_channels = input_channels
+        in_channels = input_channels * sequence_length  # 将历史帧作为通道
         
         for i, (hidden_dim, kernel_size) in enumerate(zip(hidden_dims, kernel_sizes)):
             padding = kernel_size // 2  # 保持空间尺寸
             layers.extend([
-                nn.Conv3d(
+                nn.Conv2d(
                     in_channels, 
-                    hidden_dim, 
-                    kernel_size=(kernel_size, kernel_size, kernel_size),
-                    padding=(padding, padding, padding)
+                    hidden_dim,  # 其实是output channel
+                    kernel_size=kernel_size,
+                    padding=padding
                 ),
-                nn.BatchNorm3d(hidden_dim),
+                nn.BatchNorm2d(hidden_dim),
                 nn.ELU() if activation == "elu" else nn.ReLU()
             ])
             in_channels = hidden_dim
@@ -67,37 +67,37 @@ class Conv3DEncoder(nn.Module):
         self.conv_layers = nn.Sequential(*layers)
         
         # 计算卷积后的特征图尺寸
-        # 经过卷积后，空间尺寸保持不变，时间维度可能因池化而改变
-        conv_output_shape = self._calculate_conv_output_shape(sequence_length, spatial_size)
-        self.flattened_size = conv_output_shape[0] * conv_output_shape[1] * conv_output_shape[2] * in_channels
+        # 经过卷积后，空间尺寸保持不变
+        height, width = spatial_size
+        self.flattened_size = height * width * in_channels
         
         # 全连接层将特征映射到输出维度
         self.fc = nn.Linear(self.flattened_size, output_dim)
-        
-    def _calculate_conv_output_shape(self, sequence_length: int, spatial_size: tuple[int, int]) -> tuple[int, int, int]:
-        """计算卷积后的输出形状"""
-        # 在我们的实现中，所有卷积都使用padding保持空间尺寸
-        # 如果添加池化层，这里需要相应调整
-        return (sequence_length, spatial_size[0], spatial_size[1])
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         Args:
-            x: 输入张量 [batch_size, sequence_length, height, width] 或 [batch_size, sequence_length, height, width, 1]
+            x: 输入张量 [batch_size, sequence_length, height*width]
         Returns:
             特征向量 [batch_size, output_dim]
         """
-        # 确保输入格式正确: [batch_size, channels=1, depth=sequence_length, height, width]
-        if x.dim() == 4:
-            # 输入格式: [batch_size, sequence_length, height, width]
-            x = x.unsqueeze(1)  # 添加通道维度
-        elif x.dim() == 5 and x.shape[2] == 1:
-            # 输入格式: [batch_size, sequence_length, height, width, 1]
-            x = x.permute(0, 4, 1, 2, 3)  # 调整为 [batch_size, 1, sequence_length, height, width]
+        if x.dim() != 3:
+            raise ValueError(f"Expected 3D input [batch_size, sequence_length, height*width], got {x.dim()}D input with shape {x.shape}")
         
-        # 3D卷积前向传播
-        conv_features = self.conv_layers(x)
+        height, width = self.spatial_size
+        batch_size, seq_len, flat_dim = x.shape
+        
+        # 验证展平维度是否匹配
+        expected_flat_dim = height * width
+        if flat_dim != expected_flat_dim:
+            raise ValueError(f"Expected flattened dimension {expected_flat_dim} (height={height} * width={width}), got {flat_dim}")
+        
+        # Reshape成 [batch_size, sequence_length, height, width]
+        x = x.view(batch_size, seq_len, height, width)
+        
+        # 2D卷积前向传播
+        conv_features = self.conv_layers(x)  # [batch_size, hidden_dim, height, width]
         
         # 展平特征图
         conv_features_flat = conv_features.view(conv_features.size(0), -1)
@@ -109,11 +109,11 @@ class Conv3DEncoder(nn.Module):
 
 
 class ActorCriticElevationNetMode4(nn.Module):
-    """Mode4: 类似Mode3但使用3D CNN处理高程图序列，保持时空特征
+    """Mode4: 使用2D CNN处理高程图序列（历史帧作为通道）+ VAE架构
     
     网络组成:
     1. 本体编码器MLP - 提取本体特征
-    2. 高程图3D CNN编码器 - 提取时空特征
+    2. 高程图2D CNN编码器 - 将历史帧作为通道提取空间特征
     3. 融合MLP - 融合特征
     4. VAE Encoder - 输出隐向量(速度v + 隐状态z)
     5. VAE Decoder - 重建观测
@@ -140,9 +140,9 @@ class ActorCriticElevationNetMode4(nn.Module):
         history_frames: int = 5,
         vision_spatial_size: tuple[int, int] = (25, 17),
         elevation_encoder_hidden_dims: list[int] | None = None,
-        # 3D CNN配置
-        conv3d_hidden_dims: list[int] = [16, 32, 64],
-        conv3d_kernel_sizes: list[int] = [3, 3, 3],
+        # 2D CNN配置
+        conv2d_hidden_dims: list[int] = [16, 32, 64],
+        conv2d_kernel_sizes: list[int] = [3, 3, 3],
         # 本体编码器配置
         proprio_feature_dim: int = 64,
         proprio_encoder_hidden_dims: list[int] | None = None,
@@ -171,13 +171,14 @@ class ActorCriticElevationNetMode4(nn.Module):
         # 计算观测维度
         num_actor_obs = sum(obs[g].shape[-1] for g in obs_groups["policy"] if g != "height_scan_history")
         num_critic_obs = sum(obs[g].shape[-1] for g in obs_groups["critic"] if g != "height_scan_history")
-        self.obs_one_frame_len: int = int(num_actor_obs / history_frames)
+        # 修复观测维度计算错误：obs_one_frame_len应该是单帧观测维度，不是总观测除以历史帧数
+        self.obs_one_frame_len: int = 102  # G1单帧本体观测维度固定为102
         
         ########################################## Actor ##############################################
         print("\n" + "=" * 80)
-        print("🌟 网络架构: ElevationNet Mode4 (3D CNN + VAE)")
+        print("🌟 网络架构: ElevationNet Mode4 (2D CNN + VAE)")
         print("=" * 80)
-        print("✓ Mode4: 本体编码器 + 高程图3D CNN编码器 + 融合网络 + VAE -> 动作")
+        print("✓ Mode4: 本体编码器 + 高程图2D CNN编码器(历史帧作为通道) + 融合网络 + VAE -> 动作")
         
         # 1. 本体编码器MLP
         if proprio_encoder_hidden_dims is None:
@@ -185,18 +186,18 @@ class ActorCriticElevationNetMode4(nn.Module):
         self.proprio_encoder = MLP(num_actor_obs, proprio_feature_dim, proprio_encoder_hidden_dims, activation)
         print(f"  1. 本体编码器: {num_actor_obs} -> {proprio_encoder_hidden_dims} -> {proprio_feature_dim}")
         
-        # 2. 高程图3D CNN编码器
+        # 2. 高程图2D CNN编码器（历史帧作为通道）
         height, width = vision_spatial_size
-        self.elevation_net = Conv3DEncoder(
+        self.elevation_net = Conv2DEncoder(
             input_channels=1,
             sequence_length=history_frames,
             spatial_size=vision_spatial_size,
             output_dim=vision_feature_dim,
-            hidden_dims=conv3d_hidden_dims,
-            kernel_sizes=conv3d_kernel_sizes,
+            hidden_dims=conv2d_hidden_dims,
+            kernel_sizes=conv2d_kernel_sizes,
             activation=activation
         )
-        print(f"  2. 高程图3D CNN: [{history_frames}, {height}, {width}] -> {conv3d_hidden_dims} -> {vision_feature_dim}")
+        print(f"  2. 高程图2D CNN: [{history_frames}, {height}, {width}] -> {conv2d_hidden_dims} -> {vision_feature_dim}")
         
         # 3. 融合MLP
         fusion_output_dim = encoder_hidden_dims[-1]
@@ -274,14 +275,14 @@ class ActorCriticElevationNetMode4(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def _extract_height_map_sequence(self, obs: TensorDict) -> torch.Tensor:
-        """提取高程图序列并保持3D形状用于3D CNN处理"""
+        """提取高程图序列用于2D CNN处理（历史帧作为通道）"""
         depth_obs = obs["height_scan_history"]
         while isinstance(depth_obs, TensorDict):
             keys = list(depth_obs.keys())
             depth_obs = depth_obs[keys[0]]
         
         # depth_obs 形状: [batch_size, history_frames, height, width]
-        # 已经是正确的3D形状，直接返回
+        # 这个形状适合Conv2DEncoder处理（历史帧将作为通道）
         return depth_obs
 
     def reparameterise(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -296,7 +297,7 @@ class ActorCriticElevationNetMode4(nn.Module):
         # 1. 提取本体特征
         proprio_features = self.proprio_encoder(proprio_obs)
         
-        # 2. 提取高程图特征（使用3D CNN）
+        # 2. 提取高程图特征（使用2D CNN，历史帧作为通道）
         height_map_sequence = self._extract_height_map_sequence(obs) # TODO: 高程图是否需要归一化
         vision_features = self.elevation_net(height_map_sequence)
         
@@ -582,25 +583,25 @@ class _ElevationNetMode4OnnxPolicyExporter(torch.nn.Module):
             self.normalizer = torch.nn.Identity()
 
     def forward(self, x):
-        # 输入需要包含3D高程图数据，这里简化处理
+        # 输入需要包含高程图序列数据，这里简化处理
         # 实际使用时需要根据具体输入格式调整
         obs_len = self.normalizer.in_features
         proprio_obs = x[:, 0:obs_len]
-        height_data = x[:, obs_len:]  # 包含3D高程图数据
+        height_data = x[:, obs_len:]  # 包含高程图序列数据
         
         # 归一化本体观测
         normalized_obs = self.normalizer(proprio_obs)
         
-        # 重塑高程图数据为3D格式（假设输入是展平的）
+        # 重塑高程图数据（假设输入是展平的）
         # 这里需要根据实际输入格式调整
         batch_size = x.shape[0]
         height, width = self.vision_spatial_size
         sequence_length = height_data.shape[1] // (height * width)
-        height_map_3d = height_data.view(batch_size, sequence_length, height, width)
+        height_map_sequence = height_data.view(batch_size, sequence_length, height, width)
         
         # 提取特征
         proprio_features = self.proprio_encoder(normalized_obs)
-        vision_features = self.elevation_net(height_map_3d)
+        vision_features = self.elevation_net(height_map_sequence)
         
         # 融合特征
         fused_features = torch.cat([proprio_features, vision_features], dim=-1)

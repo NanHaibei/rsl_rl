@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -22,7 +22,7 @@ from rsl_rl.utils import AMPLoader
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5
     """The actor critic module."""
 
     def __init__(
@@ -102,17 +102,14 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 = policy
         self.policy.to(self.device)
-        # 如果使用了EstNet、DWAQ或ElevationNetMode3
-        self.estnet = False
-        self.dwaq = False
-        self.elevation_net_mode3 = False
+        # 如果使用了EstNet、DWAQ或ElevationNetMode3/4/5
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
         self.dwaq = True if type(self.policy) == ActorCriticDWAQ else False
         self.elevation_net_mode3 = True if type(self.policy) == ActorCriticElevationNetMode3 else False
         self.elevation_net_mode4 = True if type(self.policy) == ActorCriticElevationNetMode4 else False
-        # self.delta_sine = True if type(self.policy) == ActorCritic_DeltaSine else False
+        self.elevation_net_mode5 = True if type(self.policy) == ActorCriticElevationNetMode5 else False
 
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)
@@ -374,8 +371,8 @@ class PPO:
                         for param_group in self.encoder_optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
-            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3和ElevationNetMode4)
-            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4:
+            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5)
+            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4 or self.elevation_net_mode5:
                 encoder_losses = self.policy.update_encoder(
                     obs_batch, 
                     next_observations_batch, 

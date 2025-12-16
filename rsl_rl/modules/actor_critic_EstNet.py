@@ -12,7 +12,8 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-
+import copy
+import os
 
 class ActorCriticEstNet(nn.Module):
     is_recurrent: bool = False
@@ -281,3 +282,94 @@ class ActorCriticEstNet(nn.Module):
             "vel_loss": vel_MSE.item(),
             "total_loss": vel_MSE.item(),
         }
+
+    def create_optimizers(self, learning_rate: float) -> dict[str, torch.optim.Optimizer]:
+        """创建优化器
+        
+        Args:
+            learning_rate: 学习率
+            
+        Returns:
+            优化器字典，包含主要的优化器和编码器优化器
+        """
+        import torch.optim as optim
+        
+        optimizer = optim.Adam([
+            {'params': self.actor.parameters()},
+            {'params': self.critic.parameters()},
+            {'params': [self.std] if self.noise_std_type == "scalar" else [self.log_std]},
+        ], lr=learning_rate)
+        
+        encoder_optimizer = optim.Adam([
+            {'params': self.encoder.parameters()},
+        ], lr=learning_rate)
+        
+        return {
+            "optimizer": optimizer,
+            "encoder_optimizer": encoder_optimizer
+        }
+
+    def export_to_onnx(self, path: str, filename: str = "Estnet_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将EstNet策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"Estnet_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建EstNet专用的导出器
+        exporter = _EstNetOnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _EstNetOnnxPolicyExporter(torch.nn.Module):
+    """EstNet策略的ONNX导出器"""
+
+    def __init__(self, policy: ActorCriticEstNet, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        # 复制策略参数
+        if hasattr(policy, "actor"):
+            self.actor = copy.deepcopy(policy.actor)
+
+        # 复制编码器
+        self.encoder = copy.deepcopy(policy.encoder)
+        # 一帧观测的长度
+        self.obs_one_frame_len = policy.obs_one_frame_len
+
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+
+    def forward(self, x):
+        obs = self.normalizer(x)
+        est_vel = self.encoder(obs)
+        new_obs = obs[:, 0:self.obs_one_frame_len]
+        obs_actor = torch.cat((est_vel.detach(), new_obs), dim=-1)
+        actions_mean = self.actor(obs_actor)
+        return actions_mean, est_vel
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        obs = torch.zeros(1, self.encoder[0].in_features)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions","est_vel"],
+            dynamic_axes={},
+        )

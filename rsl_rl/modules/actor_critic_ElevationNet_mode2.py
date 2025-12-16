@@ -21,7 +21,8 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-
+import copy
+import os
 
 class ActorCriticElevationNetMode2(nn.Module):
     """Mode2: 本体和高程图分别提取特征后融合输出动作
@@ -249,3 +250,81 @@ class ActorCriticElevationNetMode2(nn.Module):
         """加载模型参数"""
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode2_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将ElevationNet Mode2策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"ElevationNet_mode2_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建ElevationNet Mode2专用的导出器
+        exporter = _ElevationNetMode2OnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _ElevationNetMode2OnnxPolicyExporter(torch.nn.Module):
+    """ElevationNet Mode2策略的ONNX导出器"""
+
+    def __init__(self, policy: ActorCriticElevationNetMode2, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        # 复制策略参数
+        if hasattr(policy, "proprio_encoder"):
+            self.proprio_encoder = copy.deepcopy(policy.proprio_encoder)
+        if hasattr(policy, "elevation_net"):
+            self.elevation_net = copy.deepcopy(policy.elevation_net)
+        if hasattr(policy, "fusion_actor"):
+            self.fusion_actor = copy.deepcopy(policy.fusion_actor)
+
+        # 复制归一化器
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+
+    def forward(self, x):
+        # 假设输入是 [本体观测 + 高程图序列展平]
+        # 需要分离本体观测和高程图
+        obs_len = self.normalizer.in_features
+        proprio_obs = x[:, 0:obs_len]
+        height_map_sequence = x[:, obs_len:]
+        
+        # 归一化本体观测
+        normalized_obs = self.normalizer(proprio_obs)
+        
+        # 提取特征
+        proprio_features = self.proprio_encoder(normalized_obs)
+        vision_features = self.elevation_net(height_map_sequence)
+        
+        # 融合特征并输出动作
+        fused_features = torch.cat([proprio_features, vision_features], dim=-1)
+        actions_mean = self.fusion_actor(fused_features)
+        return actions_mean
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        # 创建输入示例
+        total_dim = self.normalizer.in_features + self.elevation_net[0].in_features
+        obs = torch.zeros(1, total_dim)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )

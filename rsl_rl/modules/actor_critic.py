@@ -12,7 +12,8 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-
+import copy
+import os
 
 class ActorCritic(nn.Module):
     is_recurrent: bool = False
@@ -200,3 +201,75 @@ class ActorCritic(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def create_optimizers(self, learning_rate: float) -> dict[str, torch.optim.Optimizer]:
+        """创建优化器
+        
+        Args:
+            learning_rate: 学习率
+            
+        Returns:
+            优化器字典，包含主要的优化器
+        """
+        import torch.optim as optim
+        
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        return {"optimizer": optimizer}
+
+    def export_to_onnx(self, path: str, filename: str = "policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建导出器
+        exporter = _OnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _OnnxPolicyExporter(torch.nn.Module):
+    """基础Actor-Critic的ONNX导出器"""
+    
+    def __init__(self, policy: ActorCritic, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        # 复制策略参数
+        if hasattr(policy, "actor"):
+            self.actor = copy.deepcopy(policy.actor)
+        
+        # 复制归一化器
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+    
+    def forward(self, x):
+        obs = self.normalizer(x)
+        actions_mean = self.actor(obs)
+        return actions_mean
+    
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        obs = torch.zeros(1, self.normalizer.in_features)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )

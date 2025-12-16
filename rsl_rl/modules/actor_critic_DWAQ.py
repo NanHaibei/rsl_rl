@@ -12,7 +12,8 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-
+import copy
+import os
 
 class ActorCriticDWAQ(nn.Module):
     is_recurrent: bool = False
@@ -373,3 +374,103 @@ class ActorCriticDWAQ(nn.Module):
             "dkl_loss": dkl_loss.item(),
             "total_loss": autoenc_loss.item(),
         }
+
+    def create_optimizers(self, learning_rate: float) -> dict[str, torch.optim.Optimizer]:
+        """创建优化器
+        
+        Args:
+            learning_rate: 学习率
+            
+        Returns:
+            优化器字典，包含主要的优化器和编码器优化器
+        """
+        import torch.optim as optim
+        
+        optimizer = optim.Adam([
+            {'params': self.actor.parameters()},
+            {'params': self.critic.parameters()},
+            {'params': [self.std] if self.noise_std_type == "scalar" else [self.log_std]},
+        ], lr=learning_rate)
+        
+        encoder_optimizer = optim.Adam([
+            {'params': self.encoder_backbone.parameters()},
+            {'params': self.encoder_latent_mean.parameters()},
+            {'params': self.encoder_latent_logvar.parameters()},
+            {'params': self.encoder_vel_mean.parameters()},
+            {'params': self.encoder_vel_logvar.parameters()},
+            {'params': self.decoder.parameters()},
+        ], lr=learning_rate)
+        
+        return {
+            "optimizer": optimizer,
+            "encoder_optimizer": encoder_optimizer
+        }
+
+    def export_to_onnx(self, path: str, filename: str = "Estnet_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将DWAQ策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"Estnet_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建DWAQ专用的导出器
+        exporter = _DWAQOnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _DWAQOnnxPolicyExporter(torch.nn.Module):
+    """DWAQ策略的ONNX导出器"""
+
+    def __init__(self, policy: ActorCriticDWAQ, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        # 复制策略参数
+        if hasattr(policy, "actor"):
+            self.actor = copy.deepcopy(policy.actor)
+
+        # 复制编码器
+        self.encoder = copy.deepcopy(policy.encoder_backbone)
+        self.encoder_vel_head = copy.deepcopy(policy.encoder_vel_mean)
+        self.encoder_latent_head = copy.deepcopy(policy.encoder_latent_mean)
+        # 一帧观测的长度
+        self.obs_one_frame_len = policy.obs_one_frame_len
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+    
+    def forward(self, obs):
+        obs_noarmalized = self.normalizer(obs)
+        x = self.encoder(obs_noarmalized)
+        vel = self.encoder_vel_head(x)
+        latent = self.encoder_latent_head(x)
+        code = torch.cat((vel, latent), dim=-1)
+        now_obs = obs_noarmalized[:, 0:self.obs_one_frame_len]  # 获取当前观测值
+        observations = torch.cat((code.detach(), now_obs), dim=-1)
+        actions_mean = self.actor(observations)
+        return actions_mean, vel
+    
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        obs = torch.zeros(1, self.encoder[0].in_features)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions","est_vel"],
+            dynamic_axes={},
+        )

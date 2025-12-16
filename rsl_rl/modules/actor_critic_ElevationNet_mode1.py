@@ -18,7 +18,8 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-
+import copy
+import os
 
 class ActorCriticElevationNetMode1(nn.Module):
     """Mode1: 本体观测和高程图拼接后直接进MLP输出动作
@@ -209,3 +210,76 @@ class ActorCriticElevationNetMode1(nn.Module):
         """加载模型参数"""
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode1_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将ElevationNet Mode1策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"ElevationNet_mode1_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建ElevationNet Mode1专用的导出器
+        exporter = _ElevationNetMode1OnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _ElevationNetMode1OnnxPolicyExporter(torch.nn.Module):
+    """ElevationNet Mode1策略的ONNX导出器"""
+
+    def __init__(self, policy: ActorCriticElevationNetMode1, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        # 复制策略参数
+        if hasattr(policy, "direct_actor"):
+            self.direct_actor = copy.deepcopy(policy.direct_actor)
+
+        # 复制归一化器
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+        
+        # 计算高程图展平后的维度
+        height, width = policy.vision_spatial_size
+        self.height_map_dim = height * width
+
+    def forward(self, x):
+        # 假设输入是 [本体观测 + 高程图]
+        obs_len = x.shape[-1] - self.height_map_dim
+        proprio_obs = x[:, 0:obs_len]
+        height_map = x[:, obs_len:]
+        
+        # 归一化本体观测
+        normalized_obs = self.normalizer(proprio_obs)
+        
+        # 拼接后输入actor
+        actor_input = torch.cat([normalized_obs, height_map], dim=-1)
+        actions_mean = self.direct_actor(actor_input)
+        return actions_mean
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        # 创建输入示例：[本体观测 + 高程图展平]
+        total_dim = self.normalizer.in_features + self.height_map_dim
+        obs = torch.zeros(1, total_dim)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )

@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode3
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -22,7 +22,7 @@ from rsl_rl.utils import AMPLoader
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4
     """The actor critic module."""
 
     def __init__(
@@ -102,7 +102,7 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ或ElevationNetMode3
         self.estnet = False
@@ -111,50 +111,13 @@ class PPO:
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
         self.dwaq = True if type(self.policy) == ActorCriticDWAQ else False
         self.elevation_net_mode3 = True if type(self.policy) == ActorCriticElevationNetMode3 else False
+        self.elevation_net_mode4 = True if type(self.policy) == ActorCriticElevationNetMode4 else False
         # self.delta_sine = True if type(self.policy) == ActorCritic_DeltaSine else False
 
-        # Create optimizer
-        if self.estnet:
-            self.optimizer = torch.optim.Adam([
-                {'params': self.policy.actor.parameters()},
-                {'params': self.policy.critic.parameters()},
-                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-            ], lr=learning_rate)
-            self.encoder_optimizer = torch.optim.Adam([
-                {'params': self.policy.encoder.parameters()},
-            ], lr=learning_rate)
-        elif self.dwaq:
-            self.optimizer = torch.optim.Adam([
-                {'params': self.policy.actor.parameters()},
-                {'params': self.policy.critic.parameters()},
-                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-            ], lr=learning_rate)
-            self.encoder_optimizer = torch.optim.Adam([
-                {'params': self.policy.encoder_backbone.parameters()},
-                {'params': self.policy.encoder_latent_mean.parameters()},
-                {'params': self.policy.encoder_latent_logvar.parameters()},
-                {'params': self.policy.encoder_vel_mean.parameters()},
-                {'params': self.policy.encoder_vel_logvar.parameters()},
-                {'params': self.policy.decoder.parameters()},
-            ], lr=learning_rate)
-        elif self.elevation_net_mode3:
-            self.optimizer = torch.optim.Adam([
-                {'params': self.policy.actor.parameters()},
-                {'params': self.policy.critic.parameters()},
-                {'params': [self.policy.std] if self.policy.noise_std_type == "scalar" else [self.policy.log_std]},
-            ], lr=learning_rate)
-            self.encoder_optimizer = torch.optim.Adam([
-                {'params': self.policy.proprio_encoder.parameters()},
-                {'params': self.policy.elevation_net.parameters()},
-                {'params': self.policy.fusion_encoder.parameters()},
-                {'params': self.policy.encoder_latent_mean.parameters()},
-                {'params': self.policy.encoder_latent_logvar.parameters()},
-                {'params': self.policy.encoder_vel_mean.parameters()},
-                {'params': self.policy.encoder_vel_logvar.parameters()},
-                {'params': self.policy.decoder.parameters()},
-            ], lr=learning_rate)
-        else:
-            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # Create optimizer using policy's create_optimizers method
+        optimizers_dict = self.policy.create_optimizers(learning_rate)
+        self.optimizer = optimizers_dict.get("optimizer")
+        self.encoder_optimizer = optimizers_dict.get("encoder_optimizer")
 
         # AMP Discriminator
         if hasattr(self.policy, 'amp_discriminator') and self.policy.amp_discriminator is not None:
@@ -407,12 +370,12 @@ class PPO:
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
-                    if self.estnet or self.dwaq or self.elevation_net_mode3:
+                    if self.encoder_optimizer is not None:
                         for param_group in self.encoder_optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
-            # Encoder update step (统一接口，适用于EstNet、DWAQ和ElevationNetMode3)
-            if self.estnet or self.dwaq or self.elevation_net_mode3:
+            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3和ElevationNetMode4)
+            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4:
                 encoder_losses = self.policy.update_encoder(
                     obs_batch, 
                     next_observations_batch, 

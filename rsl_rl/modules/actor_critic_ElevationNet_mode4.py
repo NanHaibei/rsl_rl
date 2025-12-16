@@ -4,11 +4,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-ActorCriticElevationNetMode3: VAE编码器架构
+ActorCriticElevationNetMode4: VAE编码器架构，使用3D CNN处理高程图序列
 
 网络结构:
     本体 -> 本体编码器MLP -> 特征1
-    高程图 -> 高程图编码器MLP -> 特征2
+    高程图序列 -> 3D CNN编码器 -> 特征2
     [特征1 + 特征2] -> 融合MLP -> 编码特征
     编码特征 -> Encoder -> 隐向量(v+z)
     隐向量 -> Decoder -> 重建观测
@@ -27,12 +27,93 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
 import os
 
-class ActorCriticElevationNetMode3(nn.Module):
-    """Mode3: 类似Mode2但输出隐向量（包含速度估计），类似DWAQ
+class Conv3DEncoder(nn.Module):
+    """3D CNN编码器，用于处理高程图序列"""
+    
+    def __init__(
+        self,
+        input_channels: int,
+        sequence_length: int,
+        spatial_size: tuple[int, int],
+        output_dim: int,
+        hidden_dims: list[int] = [16, 32, 64],
+        kernel_sizes: list[int] = [3, 3, 3],
+        activation: str = "elu"
+    ) -> None:
+        super().__init__()
+        
+        self.sequence_length = sequence_length
+        self.spatial_size = spatial_size
+        self.output_dim = output_dim
+        
+        # 构建3D卷积层
+        layers = []
+        in_channels = input_channels
+        
+        for i, (hidden_dim, kernel_size) in enumerate(zip(hidden_dims, kernel_sizes)):
+            padding = kernel_size // 2  # 保持空间尺寸
+            layers.extend([
+                nn.Conv3d(
+                    in_channels, 
+                    hidden_dim, 
+                    kernel_size=(kernel_size, kernel_size, kernel_size),
+                    padding=(padding, padding, padding)
+                ),
+                nn.BatchNorm3d(hidden_dim),
+                nn.ELU() if activation == "elu" else nn.ReLU()
+            ])
+            in_channels = hidden_dim
+        
+        self.conv_layers = nn.Sequential(*layers)
+        
+        # 计算卷积后的特征图尺寸
+        # 经过卷积后，空间尺寸保持不变，时间维度可能因池化而改变
+        conv_output_shape = self._calculate_conv_output_shape(sequence_length, spatial_size)
+        self.flattened_size = conv_output_shape[0] * conv_output_shape[1] * conv_output_shape[2] * in_channels
+        
+        # 全连接层将特征映射到输出维度
+        self.fc = nn.Linear(self.flattened_size, output_dim)
+        
+    def _calculate_conv_output_shape(self, sequence_length: int, spatial_size: tuple[int, int]) -> tuple[int, int, int]:
+        """计算卷积后的输出形状"""
+        # 在我们的实现中，所有卷积都使用padding保持空间尺寸
+        # 如果添加池化层，这里需要相应调整
+        return (sequence_length, spatial_size[0], spatial_size[1])
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        Args:
+            x: 输入张量 [batch_size, sequence_length, height, width] 或 [batch_size, sequence_length, height, width, 1]
+        Returns:
+            特征向量 [batch_size, output_dim]
+        """
+        # 确保输入格式正确: [batch_size, channels=1, depth=sequence_length, height, width]
+        if x.dim() == 4:
+            # 输入格式: [batch_size, sequence_length, height, width]
+            x = x.unsqueeze(1)  # 添加通道维度
+        elif x.dim() == 5 and x.shape[2] == 1:
+            # 输入格式: [batch_size, sequence_length, height, width, 1]
+            x = x.permute(0, 4, 1, 2, 3)  # 调整为 [batch_size, 1, sequence_length, height, width]
+        
+        # 3D卷积前向传播
+        conv_features = self.conv_layers(x)
+        
+        # 展平特征图
+        conv_features_flat = conv_features.view(conv_features.size(0), -1)
+        
+        # 全连接层
+        output = self.fc(conv_features_flat)
+        
+        return output
+
+
+class ActorCriticElevationNetMode4(nn.Module):
+    """Mode4: 类似Mode3但使用3D CNN处理高程图序列，保持时空特征
     
     网络组成:
     1. 本体编码器MLP - 提取本体特征
-    2. 高程图编码器MLP - 提取视觉特征
+    2. 高程图3D CNN编码器 - 提取时空特征
     3. 融合MLP - 融合特征
     4. VAE Encoder - 输出隐向量(速度v + 隐状态z)
     5. VAE Decoder - 重建观测
@@ -59,6 +140,9 @@ class ActorCriticElevationNetMode3(nn.Module):
         history_frames: int = 5,
         vision_spatial_size: tuple[int, int] = (25, 17),
         elevation_encoder_hidden_dims: list[int] | None = None,
+        # 3D CNN配置
+        conv3d_hidden_dims: list[int] = [16, 32, 64],
+        conv3d_kernel_sizes: list[int] = [3, 3, 3],
         # 本体编码器配置
         proprio_feature_dim: int = 64,
         proprio_encoder_hidden_dims: list[int] | None = None,
@@ -84,22 +168,16 @@ class ActorCriticElevationNetMode3(nn.Module):
         self.num_decode = num_decode
         num_actor_obs = 0
         
-        
         # 计算观测维度
         num_actor_obs = sum(obs[g].shape[-1] for g in obs_groups["policy"] if g != "height_scan_history")
         num_critic_obs = sum(obs[g].shape[-1] for g in obs_groups["critic"] if g != "height_scan_history")
         self.obs_one_frame_len: int = int(num_actor_obs / history_frames)
         
-        # 计算高程图展平后的维度
-        height, width = vision_spatial_size
-        height_map_dim = height * width
-        height_map_input_dim = history_frames * height_map_dim
-        
         ########################################## Actor ##############################################
         print("\n" + "=" * 80)
-        print("🌟 网络架构: ElevationNet Mode3 (VAE)")
+        print("🌟 网络架构: ElevationNet Mode4 (3D CNN + VAE)")
         print("=" * 80)
-        print("✓ Mode3: 本体编码器 + 高程图编码器 + 融合网络 + VAE -> 动作")
+        print("✓ Mode4: 本体编码器 + 高程图3D CNN编码器 + 融合网络 + VAE -> 动作")
         
         # 1. 本体编码器MLP
         if proprio_encoder_hidden_dims is None:
@@ -107,11 +185,18 @@ class ActorCriticElevationNetMode3(nn.Module):
         self.proprio_encoder = MLP(num_actor_obs, proprio_feature_dim, proprio_encoder_hidden_dims, activation)
         print(f"  1. 本体编码器: {num_actor_obs} -> {proprio_encoder_hidden_dims} -> {proprio_feature_dim}")
         
-        # 2. 高程图编码器MLP
-        if elevation_encoder_hidden_dims is None:
-            elevation_encoder_hidden_dims = [max(height_map_input_dim // 2, vision_feature_dim * 2), vision_feature_dim * 2]
-        self.elevation_net = MLP(height_map_input_dim, vision_feature_dim, elevation_encoder_hidden_dims, "elu")
-        print(f"  2. 高程图编码器: {height_map_input_dim} ({history_frames}×{height_map_dim}) -> {elevation_encoder_hidden_dims} -> {vision_feature_dim}")
+        # 2. 高程图3D CNN编码器
+        height, width = vision_spatial_size
+        self.elevation_net = Conv3DEncoder(
+            input_channels=1,
+            sequence_length=history_frames,
+            spatial_size=vision_spatial_size,
+            output_dim=vision_feature_dim,
+            hidden_dims=conv3d_hidden_dims,
+            kernel_sizes=conv3d_kernel_sizes,
+            activation=activation
+        )
+        print(f"  2. 高程图3D CNN: [{history_frames}, {height}, {width}] -> {conv3d_hidden_dims} -> {vision_feature_dim}")
         
         # 3. 融合MLP
         fusion_output_dim = encoder_hidden_dims[-1]
@@ -189,14 +274,15 @@ class ActorCriticElevationNetMode3(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def _extract_height_map_sequence(self, obs: TensorDict) -> torch.Tensor:
-        """提取高程图序列并展平"""
+        """提取高程图序列并保持3D形状用于3D CNN处理"""
         depth_obs = obs["height_scan_history"]
         while isinstance(depth_obs, TensorDict):
             keys = list(depth_obs.keys())
             depth_obs = depth_obs[keys[0]]
-        # 展平所有帧: [batch, frames, height*width] -> [batch, frames*height*width]
-        batch_size = depth_obs.shape[0]
-        return depth_obs.view(batch_size, -1)
+        
+        # depth_obs 形状: [batch_size, history_frames, height, width]
+        # 已经是正确的3D形状，直接返回
+        return depth_obs
 
     def reparameterise(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """重参数化技巧"""
@@ -210,7 +296,7 @@ class ActorCriticElevationNetMode3(nn.Module):
         # 1. 提取本体特征
         proprio_features = self.proprio_encoder(proprio_obs)
         
-        # 2. 提取高程图特征
+        # 2. 提取高程图特征（使用3D CNN）
         height_map_sequence = self._extract_height_map_sequence(obs) # TODO: 高程图是否需要归一化
         vision_features = self.elevation_net(height_map_sequence)
         
@@ -269,8 +355,11 @@ class ActorCriticElevationNetMode3(nn.Module):
         
         # 5. 记录额外信息用于监控
         self.extra_info["est_vel"] = vel_mean
-        self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
-                                                   self.actor_obs_normalizer.mean[:self.num_decode]
+        if self.actor_obs_normalization:
+            self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
+                                                       self.actor_obs_normalizer.mean[:self.num_decode]
+        else:
+            self.extra_info["obs_predict"] = decode
         
         return self.distribution.sample(), self.extra_info
 
@@ -293,8 +382,11 @@ class ActorCriticElevationNetMode3(nn.Module):
         
         # 5. 记录额外信息
         self.extra_info["est_vel"] = vel_mean
-        self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
-                                        self.actor_obs_normalizer.mean[:self.num_decode]
+        if self.actor_obs_normalization:
+            self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
+                                            self.actor_obs_normalizer.mean[:self.num_decode]
+        else:
+            self.extra_info["obs_predict"] = decode
         
         return mean, self.extra_info
 
@@ -373,8 +465,10 @@ class ActorCriticElevationNetMode3(nn.Module):
         obs_target.requires_grad = False
 
         # 损失计算：速度重建损失 + obs重建损失 + KL散度损失
-        vel_MSE = nn.MSELoss()(vel_sample, vel_target)
-        obs_MSE = nn.MSELoss()(decode, obs_target)
+        vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 100.0
+        # 确保decode和obs_target维度匹配
+        decode_target = decode[:, :obs_target.shape[1]]  # 截取匹配的维度
+        obs_MSE = nn.MSELoss()(decode_target, obs_target)
         dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
         autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
 
@@ -434,12 +528,12 @@ class ActorCriticElevationNetMode3(nn.Module):
             "encoder_optimizer": encoder_optimizer
         }
 
-    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode3_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将ElevationNet Mode3策略导出为ONNX格式
+    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode4_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将ElevationNet Mode4策略导出为ONNX格式
         
         Args:
             path: 保存目录的路径
-            filename: 导出的ONNX文件名，默认为"ElevationNet_mode3_policy.onnx"
+            filename: 导出的ONNX文件名，默认为"ElevationNet_mode4_policy.onnx"
             normalizer: 归一化模块，如果为None则使用Identity
             verbose: 是否打印模型摘要，默认为False
         """
@@ -449,15 +543,15 @@ class ActorCriticElevationNetMode3(nn.Module):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
             
-        # 创建ElevationNet Mode3专用的导出器
-        exporter = _ElevationNetMode3OnnxPolicyExporter(self, normalizer, verbose)
+        # 创建ElevationNet Mode4专用的导出器
+        exporter = _ElevationNetMode4OnnxPolicyExporter(self, normalizer, verbose)
         exporter.export(path, filename)
 
 
-class _ElevationNetMode3OnnxPolicyExporter(torch.nn.Module):
-    """ElevationNet Mode3策略的ONNX导出器"""
+class _ElevationNetMode4OnnxPolicyExporter(torch.nn.Module):
+    """ElevationNet Mode4策略的ONNX导出器"""
 
-    def __init__(self, policy: ActorCriticElevationNetMode3, normalizer=None, verbose=False):
+    def __init__(self, policy: ActorCriticElevationNetMode4, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
         # 复制策略参数
@@ -479,6 +573,7 @@ class _ElevationNetMode3OnnxPolicyExporter(torch.nn.Module):
             self.actor = copy.deepcopy(policy.actor)
         
         self.obs_one_frame_len = policy.obs_one_frame_len
+        self.vision_spatial_size = policy.vision_spatial_size
 
         # 复制归一化器
         if normalizer:
@@ -487,17 +582,25 @@ class _ElevationNetMode3OnnxPolicyExporter(torch.nn.Module):
             self.normalizer = torch.nn.Identity()
 
     def forward(self, x):
-        # 假设输入是 [本体观测 + 高程图序列展平]
+        # 输入需要包含3D高程图数据，这里简化处理
+        # 实际使用时需要根据具体输入格式调整
         obs_len = self.normalizer.in_features
         proprio_obs = x[:, 0:obs_len]
-        height_map_sequence = x[:, obs_len:]
+        height_data = x[:, obs_len:]  # 包含3D高程图数据
         
         # 归一化本体观测
         normalized_obs = self.normalizer(proprio_obs)
         
+        # 重塑高程图数据为3D格式（假设输入是展平的）
+        # 这里需要根据实际输入格式调整
+        batch_size = x.shape[0]
+        height, width = self.vision_spatial_size
+        sequence_length = height_data.shape[1] // (height * width)
+        height_map_3d = height_data.view(batch_size, sequence_length, height, width)
+        
         # 提取特征
         proprio_features = self.proprio_encoder(normalized_obs)
-        vision_features = self.elevation_net(height_map_sequence)
+        vision_features = self.elevation_net(height_map_3d)
         
         # 融合特征
         fused_features = torch.cat([proprio_features, vision_features], dim=-1)
@@ -522,8 +625,11 @@ class _ElevationNetMode3OnnxPolicyExporter(torch.nn.Module):
         self.to("cpu")
         self.eval()
         opset_version = 18
-        # 创建输入示例
-        total_dim = self.normalizer.in_features + self.elevation_net[0].in_features
+        # 创建输入示例（简化版本）
+        # 实际使用时需要根据高程图的实际尺寸计算
+        height, width = self.vision_spatial_size
+        height_map_dim = height * width * 5  # 假设5帧
+        total_dim = self.normalizer.in_features + height_map_dim
         obs = torch.zeros(1, total_dim)
         torch.onnx.export(
             self,

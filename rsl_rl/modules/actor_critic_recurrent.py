@@ -13,6 +13,8 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization, HiddenState, Memory
+import copy
+import os
 
 
 class ActorCriticRecurrent(nn.Module):
@@ -222,3 +224,68 @@ class ActorCriticRecurrent(nn.Module):
         """
         super().load_state_dict(state_dict, strict=strict)
         return True
+
+    def export_to_onnx(self, path: str, filename: str = "Recurrent_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将Recurrent策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"Recurrent_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建Recurrent专用的导出器
+        exporter = _RecurrentOnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _RecurrentOnnxPolicyExporter(torch.nn.Module):
+    """Recurrent策略的ONNX导出器"""
+
+    def __init__(self, policy: ActorCriticRecurrent, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        # 复制策略参数
+        if hasattr(policy, "memory_a"):
+            self.memory_a = copy.deepcopy(policy.memory_a)
+        if hasattr(policy, "actor"):
+            self.actor = copy.deepcopy(policy.actor)
+
+        # 复制归一化器
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+
+    def forward(self, x):
+        # 归一化观测
+        normalized_obs = self.normalizer(x)
+        # 通过RNN记忆模块
+        out_mem = self.memory_a(normalized_obs).squeeze(0)
+        # 通过actor网络
+        actions_mean = self.actor(out_mem)
+        return actions_mean
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        # 创建输入示例
+        obs = torch.zeros(1, self.normalizer.in_features)
+        torch.onnx.export(
+            self,
+            obs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )

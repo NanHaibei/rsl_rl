@@ -22,6 +22,7 @@ from .actor_critic_ElevationNet_mode2 import ActorCriticElevationNetMode2
 from .actor_critic_ElevationNet_mode3 import ActorCriticElevationNetMode3
 from .actor_critic_ElevationNet_mode4 import ActorCriticElevationNetMode4
 from .actor_critic_ElevationNet_mode5 import ActorCriticElevationNetMode5
+from .actor_critic_ElevationNet_mode6 import ActorCriticElevationNetMode6
 
 __all__ = [
     "ActorCritic",
@@ -42,4 +43,5 @@ __all__ = [
     "ActorCriticElevationNetMode3",
     "ActorCriticElevationNetMode4",
     "ActorCriticElevationNetMode5",
+    "ActorCriticElevationNetMode6",
 ]

@@ -16,7 +16,7 @@ from .actor_critic_EstNet import ActorCriticEstNet
 from .actor_critic_DWAQ import ActorCriticDWAQ
 from .amp_discriminator import AMPDiscriminator
 
-# ElevationNet: 五个独立的mode实现
+# ElevationNet: 八个独立的mode实现
 from .actor_critic_ElevationNet_mode1 import ActorCriticElevationNetMode1
 from .actor_critic_ElevationNet_mode2 import ActorCriticElevationNetMode2
 from .actor_critic_ElevationNet_mode3 import ActorCriticElevationNetMode3
@@ -24,6 +24,7 @@ from .actor_critic_ElevationNet_mode4 import ActorCriticElevationNetMode4
 from .actor_critic_ElevationNet_mode5 import ActorCriticElevationNetMode5
 from .actor_critic_ElevationNet_mode6 import ActorCriticElevationNetMode6
 from .actor_critic_ElevationNet_mode7 import ActorCriticElevationNetMode7
+from .actor_critic_ElevationNet_mode8 import ActorCriticElevationNetMode8
 
 __all__ = [
     "ActorCritic",
@@ -46,4 +47,5 @@ __all__ = [
     "ActorCriticElevationNetMode5",
     "ActorCriticElevationNetMode6",
     "ActorCriticElevationNetMode7",
+    "ActorCriticElevationNetMode8",
 ]

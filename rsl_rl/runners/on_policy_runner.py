@@ -27,6 +27,7 @@ from rsl_rl.modules import (
     ActorCriticElevationNetMode4,
     ActorCriticElevationNetMode5,
     ActorCriticElevationNetMode6,
+    ActorCriticElevationNetMode7,
     # ActorCritic_DeltaSine,
     AMPDiscriminator,
     resolve_rnd_config,
@@ -46,6 +47,7 @@ ActorCriticType = (
     | ActorCriticElevationNetMode4
     | ActorCriticElevationNetMode5
     | ActorCriticElevationNetMode6
+    | ActorCriticElevationNetMode7
 )
 
 

@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -22,7 +22,7 @@ from rsl_rl.utils import AMPLoader
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7
     """The actor critic module."""
 
     def __init__(
@@ -111,6 +111,7 @@ class PPO:
         self.elevation_net_mode4 = True if type(self.policy) == ActorCriticElevationNetMode4 else False
         self.elevation_net_mode5 = True if type(self.policy) == ActorCriticElevationNetMode5 else False
         self.elevation_net_mode6 = True if type(self.policy) == ActorCriticElevationNetMode6 else False
+        self.elevation_net_mode7 = True if type(self.policy) == ActorCriticElevationNetMode7 else False
 
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)
@@ -372,8 +373,8 @@ class PPO:
                         for param_group in self.encoder_optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
-            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5/6)
-            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4 or self.elevation_net_mode5 or self.elevation_net_mode6:
+            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5/6/7)
+            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4 or self.elevation_net_mode5 or self.elevation_net_mode6 or self.elevation_net_mode7:
                 encoder_losses = self.policy.update_encoder(
                     obs_batch, 
                     next_observations_batch, 

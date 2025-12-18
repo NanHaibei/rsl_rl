@@ -633,7 +633,21 @@ class _ElevationNetMode6OnnxPolicyExporter(torch.nn.Module):
     def forward(self, x):
         # 输入需要包含高程图序列数据，这里简化处理
         # 实际使用时需要根据具体输入格式调整
-        obs_len = self.normalizer.in_features
+        
+        # 获取normalizer的输入维度
+        if hasattr(self.normalizer, 'mean'):
+            # EmpiricalNormalization
+            obs_len = self.normalizer.mean.shape[0]
+        elif hasattr(self.normalizer, '_mean'):
+            # EmpiricalNormalization (backup)
+            obs_len = self.normalizer._mean.shape[1]
+        elif hasattr(self.normalizer, 'in_features'):
+            # 其他可能的有in_features属性的模块
+            obs_len = self.normalizer.in_features
+        else:
+            # Identity或其他模块，使用默认值或抛出错误
+            raise AttributeError(f"Cannot determine input dimension for normalizer of type {type(self.normalizer)}")
+        
         proprio_obs = x[:, 0:obs_len]
         height_data = x[:, obs_len:]  # 包含高程图序列数据
         
@@ -678,7 +692,22 @@ class _ElevationNetMode6OnnxPolicyExporter(torch.nn.Module):
         # 实际使用时需要根据高程图的实际尺寸计算
         height, width = self.vision_spatial_size
         height_map_dim = height * width * 5  # 假设5帧
-        total_dim = self.normalizer.in_features + height_map_dim
+        
+        # 获取normalizer的输入维度
+        if hasattr(self.normalizer, 'mean'):
+            # EmpiricalNormalization
+            normalizer_dim = self.normalizer.mean.shape[0]
+        elif hasattr(self.normalizer, '_mean'):
+            # EmpiricalNormalization (backup)
+            normalizer_dim = self.normalizer._mean.shape[1]
+        elif hasattr(self.normalizer, 'in_features'):
+            # 其他可能的有in_features属性的模块
+            normalizer_dim = self.normalizer.in_features
+        else:
+            # Identity或其他模块，使用默认值或抛出错误
+            raise AttributeError(f"Cannot determine input dimension for normalizer of type {type(self.normalizer)}")
+        
+        total_dim = normalizer_dim + height_map_dim
         obs = torch.zeros(1, total_dim)
         torch.onnx.export(
             self,

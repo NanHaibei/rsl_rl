@@ -23,6 +23,7 @@ from rsl_rl.modules import (
     ActorCriticDWAQ,
     ActorCriticElevationNetMode1,
     ActorCriticElevationNetMode2,
+    ActorCriticElevationNetMode2A,
     ActorCriticElevationNetMode3,
     ActorCriticElevationNetMode4,
     ActorCriticElevationNetMode5,
@@ -44,6 +45,7 @@ ActorCriticType = (
     | ActorCriticDWAQ
     | ActorCriticElevationNetMode1
     | ActorCriticElevationNetMode2
+    | ActorCriticElevationNetMode2A
     | ActorCriticElevationNetMode3
     | ActorCriticElevationNetMode4
     | ActorCriticElevationNetMode5

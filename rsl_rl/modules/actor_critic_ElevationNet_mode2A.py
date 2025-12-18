@@ -4,12 +4,17 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-ActorCriticElevationNetMode2: 特征提取+融合架构
+ActorCriticElevationNetMode2A: 简化融合架构
 
 网络结构:
-    本体 -> 本体编码器MLP -> 特征1
-    高程图 -> 高程图编码器MLP -> 特征2
-    [特征1 + 特征2] -> 融合MLP -> 动作
+    本体观测 -> 直接进入融合层
+    高程图 -> 高程图编码器MLP -> 特征 -> 融合层
+    [本体观测 + 特征] -> 融合MLP -> 动作
+
+与Mode2的区别:
+- 去掉本体观测的特征提取网络
+- 本体观测值直接进入fusion层
+- 高程图先进MLP提取特征再进fusion层
 """
 
 from __future__ import annotations
@@ -24,14 +29,13 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
 import os
 
-class ActorCriticElevationNetMode2(nn.Module):
-    """Mode2: 本体和高程图分别提取特征后融合输出动作
+class ActorCriticElevationNetMode2A(nn.Module):
+    """Mode2A: 本体观测直接融合，高程图特征提取后融合
     
-    四个MLP网络:
-    1. 本体编码器MLP - 提取本体特征
-    2. 高程图编码器MLP - 提取视觉特征
-    3. Actor融合MLP - 融合特征后输出动作
-    4. Critic MLP - 价值评估
+    三个MLP网络:
+    1. 高程图编码器MLP - 提取视觉特征
+    2. Actor融合MLP - 融合本体观测和视觉特征后输出动作
+    3. Critic MLP - 价值评估
     """
     
     is_recurrent: bool = False
@@ -53,9 +57,6 @@ class ActorCriticElevationNetMode2(nn.Module):
         vision_num_frames: int = 1,
         vision_spatial_size: tuple[int, int] = (25, 17),
         elevation_encoder_hidden_dims: list[int] | None = None,
-        # 本体编码器配置
-        proprio_feature_dim: int = 64,
-        proprio_encoder_hidden_dims: list[int] | None = None,
         # 融合网络配置
         fusion_actor_hidden_dims: list[int] | None = None,
         **kwargs: dict[str, Any],
@@ -80,29 +81,23 @@ class ActorCriticElevationNetMode2(nn.Module):
         
         ########################################## Actor ##############################################
         print("\n" + "=" * 80)
-        print("🌟 网络架构: ElevationNet Mode2")
+        print("🌟 网络架构: ElevationNet Mode2A")
         print("=" * 80)
-        print("✓ Mode2: 本体编码器 + 高程图编码器 + 融合网络 -> 动作")
+        print("✓ Mode2A: 本体观测直接融合 + 高程图编码器 + 融合网络 -> 动作")
         
-        # 1. 本体编码器MLP
-        if proprio_encoder_hidden_dims is None:
-            proprio_encoder_hidden_dims = actor_hidden_dims
-        self.proprio_encoder = MLP(num_actor_obs, proprio_feature_dim, proprio_encoder_hidden_dims, activation)
-        print(f"  1. 本体编码器: {num_actor_obs} -> {proprio_encoder_hidden_dims} -> {proprio_feature_dim}")
-        
-        # 2. 高程图编码器MLP
+        # 1. 高程图编码器MLP
         if elevation_encoder_hidden_dims is None:
             elevation_encoder_hidden_dims = [max(height_map_input_dim // 2, vision_feature_dim * 2), vision_feature_dim * 2]
         self.elevation_net = MLP(height_map_input_dim, vision_feature_dim, elevation_encoder_hidden_dims, "elu")
-        print(f"  2. 高程图编码器: {height_map_input_dim} ({vision_num_frames}×{height_map_dim}) -> {elevation_encoder_hidden_dims} -> {vision_feature_dim}")
+        print(f"  1. 高程图编码器: {height_map_input_dim} ({vision_num_frames}×{height_map_dim}) -> {elevation_encoder_hidden_dims} -> {vision_feature_dim}")
         
-        # 3. Actor融合MLP
+        # 2. Actor融合MLP
         if fusion_actor_hidden_dims is None:
             fusion_actor_hidden_dims = actor_hidden_dims if actor_hidden_dims else [256, 128]
             print(f"     ℹ️  fusion_actor_hidden_dims未设置，使用actor_hidden_dims={fusion_actor_hidden_dims}")
-        fusion_input_dim = proprio_feature_dim + vision_feature_dim
+        fusion_input_dim = num_actor_obs + vision_feature_dim
         self.fusion_actor = MLP(fusion_input_dim, num_actions, fusion_actor_hidden_dims, "elu")
-        print(f"  3. 融合MLP: {fusion_input_dim} (本体{proprio_feature_dim} + 视觉{vision_feature_dim}) -> {fusion_actor_hidden_dims} -> {num_actions}")
+        print(f"  2. 融合MLP: {fusion_input_dim} (本体观测{num_actor_obs} + 视觉特征{vision_feature_dim}) -> {fusion_actor_hidden_dims} -> {num_actions}")
 
         # Actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -113,7 +108,7 @@ class ActorCriticElevationNetMode2(nn.Module):
 
         ########################################## Critic ##############################################
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
-        print(f"  4. Critic MLP: {num_critic_obs} -> {critic_hidden_dims} -> 1")
+        print(f"  3. Critic MLP: {num_critic_obs} -> {critic_hidden_dims} -> 1")
         print("=" * 80 + "\n")
 
         # Critic observation normalization
@@ -178,15 +173,12 @@ class ActorCriticElevationNetMode2(nn.Module):
         proprio_obs = self.get_actor_obs(obs)
         proprio_obs = self.actor_obs_normalizer(proprio_obs)
         
-        # 2. 提取本体特征
-        proprio_features = self.proprio_encoder(proprio_obs)
-        
-        # 3. 提取高程图特征
+        # 2. 提取高程图特征
         height_map_sequence = self._extract_height_map_sequence(obs)
         vision_features = self.elevation_net(height_map_sequence)
         
-        # 4. 融合特征并输出动作
-        fused_features = torch.cat([proprio_features, vision_features], dim=-1)
+        # 3. 融合本体观测和视觉特征并输出动作
+        fused_features = torch.cat([proprio_obs, vision_features], dim=-1)
         mean = self.fusion_actor(fused_features)
         
         self._update_distribution(mean)
@@ -198,15 +190,12 @@ class ActorCriticElevationNetMode2(nn.Module):
         proprio_obs = self.get_actor_obs(obs)
         proprio_obs = self.actor_obs_normalizer(proprio_obs)
         
-        # 2. 提取本体特征
-        proprio_features = self.proprio_encoder(proprio_obs)
-        
-        # 3. 提取高程图特征
+        # 2. 提取高程图特征
         height_map_sequence = self._extract_height_map_sequence(obs)
         vision_features = self.elevation_net(height_map_sequence)
         
-        # 4. 融合特征并输出动作（确定性）
-        fused_features = torch.cat([proprio_features, vision_features], dim=-1)
+        # 3. 融合本体观测和视觉特征并输出动作（确定性）
+        fused_features = torch.cat([proprio_obs, vision_features], dim=-1)
         mean = self.fusion_actor(fused_features)
         
         return mean, self.extra_info
@@ -263,7 +252,6 @@ class ActorCriticElevationNetMode2(nn.Module):
         import torch.optim as optim
         
         optimizer = optim.Adam([
-            {'params': self.proprio_encoder.parameters()},
             {'params': self.elevation_net.parameters()},
             {'params': self.fusion_actor.parameters()},
             {'params': self.critic.parameters()},
@@ -274,12 +262,12 @@ class ActorCriticElevationNetMode2(nn.Module):
             "optimizer": optimizer
         }
 
-    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode2_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将ElevationNet Mode2策略导出为ONNX格式
+    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode2A_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将ElevationNet Mode2A策略导出为ONNX格式
         
         Args:
             path: 保存目录的路径
-            filename: 导出的ONNX文件名，默认为"ElevationNet_mode2_policy.onnx"
+            filename: 导出的ONNX文件名，默认为"ElevationNet_mode2A_policy.onnx"
             normalizer: 归一化模块，如果为None则使用Identity
             verbose: 是否打印模型摘要，默认为False
         """
@@ -289,20 +277,18 @@ class ActorCriticElevationNetMode2(nn.Module):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
             
-        # 创建ElevationNet Mode2专用的导出器
-        exporter = _ElevationNetMode2OnnxPolicyExporter(self, normalizer, verbose)
+        # 创建ElevationNet Mode2A专用的导出器
+        exporter = _ElevationNetMode2AOnnxPolicyExporter(self, normalizer, verbose)
         exporter.export(path, filename)
 
 
-class _ElevationNetMode2OnnxPolicyExporter(torch.nn.Module):
-    """ElevationNet Mode2策略的ONNX导出器"""
+class _ElevationNetMode2AOnnxPolicyExporter(torch.nn.Module):
+    """ElevationNet Mode2A策略的ONNX导出器"""
 
-    def __init__(self, policy: ActorCriticElevationNetMode2, normalizer=None, verbose=False):
+    def __init__(self, policy: ActorCriticElevationNetMode2A, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
         # 复制策略参数
-        if hasattr(policy, "proprio_encoder"):
-            self.proprio_encoder = copy.deepcopy(policy.proprio_encoder)
         if hasattr(policy, "elevation_net"):
             self.elevation_net = copy.deepcopy(policy.elevation_net)
         if hasattr(policy, "fusion_actor"):
@@ -324,12 +310,11 @@ class _ElevationNetMode2OnnxPolicyExporter(torch.nn.Module):
         # 归一化本体观测
         normalized_obs = self.normalizer(proprio_obs)
         
-        # 提取特征
-        proprio_features = self.proprio_encoder(normalized_obs)
+        # 提取高程图特征
         vision_features = self.elevation_net(height_map_sequence)
         
-        # 融合特征并输出动作
-        fused_features = torch.cat([proprio_features, vision_features], dim=-1)
+        # 融合本体观测和视觉特征并输出动作
+        fused_features = torch.cat([normalized_obs, vision_features], dim=-1)
         actions_mean = self.fusion_actor(fused_features)
         return actions_mean
 

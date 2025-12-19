@@ -86,15 +86,10 @@ class ActorCriticElevationNetMode2A(nn.Module):
         print("✓ Mode2A: 本体观测直接融合 + 高程图编码器 + 融合网络 -> 动作")
         
         # 1. 高程图编码器MLP
-        if elevation_encoder_hidden_dims is None:
-            elevation_encoder_hidden_dims = [max(height_map_input_dim // 2, vision_feature_dim * 2), vision_feature_dim * 2]
         self.elevation_net = MLP(height_map_input_dim, vision_feature_dim, elevation_encoder_hidden_dims, "elu")
         print(f"  1. 高程图编码器: {height_map_input_dim} ({vision_num_frames}×{height_map_dim}) -> {elevation_encoder_hidden_dims} -> {vision_feature_dim}")
         
         # 2. Actor融合MLP
-        if fusion_actor_hidden_dims is None:
-            fusion_actor_hidden_dims = actor_hidden_dims if actor_hidden_dims else [256, 128]
-            print(f"     ℹ️  fusion_actor_hidden_dims未设置，使用actor_hidden_dims={fusion_actor_hidden_dims}")
         fusion_input_dim = num_actor_obs + vision_feature_dim
         self.fusion_actor = MLP(fusion_input_dim, num_actions, fusion_actor_hidden_dims, "elu")
         print(f"  2. 融合MLP: {fusion_input_dim} (本体观测{num_actor_obs} + 视觉特征{vision_feature_dim}) -> {fusion_actor_hidden_dims} -> {num_actions}")
@@ -148,15 +143,15 @@ class ActorCriticElevationNetMode2A(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _extract_height_map_sequence(self, obs: TensorDict) -> torch.Tensor:
-        """提取高程图序列并展平"""
-        depth_obs = obs["height_scan_history"]
-        while isinstance(depth_obs, TensorDict):
-            keys = list(depth_obs.keys())
-            depth_obs = depth_obs[keys[0]]
-        # 展平所有帧: [batch, frames, height*width] -> [batch, frames*height*width]
-        batch_size = depth_obs.shape[0]
-        return depth_obs.view(batch_size, -1)
+    # def _extract_height_map_sequence(self, obs: TensorDict) -> torch.Tensor:
+    #     """提取高程图序列并展平"""
+    #     depth_obs = obs["height_scan_history"]
+    #     while isinstance(depth_obs, TensorDict):
+    #         keys = list(depth_obs.keys())
+    #         depth_obs = depth_obs[keys[0]]
+    #     # 展平所有帧: [batch, frames, height*width] -> [batch, frames*height*width]
+    #     batch_size = depth_obs.shape[0]
+    #     return depth_obs.view(batch_size, -1)
 
     def _update_distribution(self, mean: torch.Tensor) -> None:
         """更新动作分布"""
@@ -174,7 +169,8 @@ class ActorCriticElevationNetMode2A(nn.Module):
         proprio_obs = self.actor_obs_normalizer(proprio_obs)
         
         # 2. 提取高程图特征
-        height_map_sequence = self._extract_height_map_sequence(obs)
+        # height_map_sequence = self._extract_height_map_sequence(obs)
+        height_map_sequence = obs["height_scan_history"].view(obs["height_scan_history"].shape[0], -1)
         vision_features = self.elevation_net(height_map_sequence)
         
         # 3. 融合本体观测和视觉特征并输出动作
@@ -191,7 +187,8 @@ class ActorCriticElevationNetMode2A(nn.Module):
         proprio_obs = self.actor_obs_normalizer(proprio_obs)
         
         # 2. 提取高程图特征
-        height_map_sequence = self._extract_height_map_sequence(obs)
+        # height_map_sequence = self._extract_height_map_sequence(obs)
+        height_map_sequence = obs["height_scan_history"].view(obs["height_scan_history"].shape[0], -1)
         vision_features = self.elevation_net(height_map_sequence)
         
         # 3. 融合本体观测和视觉特征并输出动作（确定性）

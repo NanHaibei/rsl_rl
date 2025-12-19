@@ -584,12 +584,44 @@ class PPO:
         model_params = [self.policy.state_dict()]
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
+        # 添加encoder_optimizer相关参数的广播（修复mode7双卡训练问题）
+        if self.encoder_optimizer is not None:
+            # 获取encoder相关的参数状态
+            encoder_params_dict = {}
+            # 从policy中获取encoder相关的参数
+            if hasattr(self.policy, 'proprio_encoder'):
+                encoder_params_dict['proprio_encoder'] = self.policy.proprio_encoder.state_dict()
+            if hasattr(self.policy, 'elevation_net'):
+                encoder_params_dict['elevation_net'] = self.policy.elevation_net.state_dict()
+            if hasattr(self.policy, 'fusion_encoder'):
+                encoder_params_dict['fusion_encoder'] = self.policy.fusion_encoder.state_dict()
+            if hasattr(self.policy, 'encoder_latent_mean'):
+                encoder_params_dict['encoder_latent_mean'] = self.policy.encoder_latent_mean.state_dict()
+            if hasattr(self.policy, 'encoder_latent_logvar'):
+                encoder_params_dict['encoder_latent_logvar'] = self.policy.encoder_latent_logvar.state_dict()
+            if hasattr(self.policy, 'encoder_vel_mean'):
+                encoder_params_dict['encoder_vel_mean'] = self.policy.encoder_vel_mean.state_dict()
+            if hasattr(self.policy, 'encoder_vel_logvar'):
+                encoder_params_dict['encoder_vel_logvar'] = self.policy.encoder_vel_logvar.state_dict()
+            if hasattr(self.policy, 'decoder'):
+                encoder_params_dict['decoder'] = self.policy.decoder.state_dict()
+            
+            if encoder_params_dict:
+                model_params.append(encoder_params_dict)
+        
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
         self.policy.load_state_dict(model_params[0])
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[1])
+        
+        # 加载encoder相关参数（如果有）
+        if self.encoder_optimizer is not None and len(model_params) > 2:
+            encoder_params_dict = model_params[2] if self.rnd else model_params[1]
+            for key, state_dict in encoder_params_dict.items():
+                if hasattr(self.policy, key):
+                    getattr(self.policy, key).load_state_dict(state_dict)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -600,6 +632,13 @@ class PPO:
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
+        # 添加encoder_optimizer的参数梯度同步（修复mode7双卡训练问题）
+        if self.encoder_optimizer is not None:
+            grads += [param.grad.view(-1) for param_group in self.encoder_optimizer.param_groups for param in param_group['params'] if param.grad is not None]
+        
+        if not grads:
+            return  # 如果没有梯度需要同步，直接返回
+            
         all_grads = torch.cat(grads)
 
         # Average the gradients across all GPUs
@@ -610,6 +649,9 @@ class PPO:
         all_params = self.policy.parameters()
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
+        # 添加encoder_optimizer的参数到参数列表中
+        if self.encoder_optimizer is not None:
+            all_params = chain(all_params, *[param for param_group in self.encoder_optimizer.param_groups for param in param_group['params']])
 
         # Update the gradients for all parameters with the reduced gradients
         offset = 0

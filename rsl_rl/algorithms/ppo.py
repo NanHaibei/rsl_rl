@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -605,6 +605,11 @@ class PPO:
                 encoder_params_dict['encoder_vel_logvar'] = self.policy.encoder_vel_logvar.state_dict()
             if hasattr(self.policy, 'decoder'):
                 encoder_params_dict['decoder'] = self.policy.decoder.state_dict()
+            # Mode9特有的encoder参数
+            if hasattr(self.policy, 'elevation_encoder_actor'):
+                encoder_params_dict['elevation_encoder_actor'] = self.policy.elevation_encoder_actor.state_dict()
+            if hasattr(self.policy, 'elevation_encoder_critic'):
+                encoder_params_dict['elevation_encoder_critic'] = self.policy.elevation_encoder_critic.state_dict()
             
             if encoder_params_dict:
                 model_params.append(encoder_params_dict)

@@ -184,11 +184,11 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 从50帧历史中采样5帧，使用更健壮的采样逻辑
         # 直接使用固定索引采样，然后重塑为图像格式
-        sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
-        sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
-        # sampled_height_maps = height_maps
+        # sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
+        # sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
+        sampled_height_maps = height_maps.squeeze(1)  # [B, 50, H, W]
         # 重塑为图像格式 [B, 5, H, W]
-        sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
+        # sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_actor(sampled_height_maps)
@@ -213,11 +213,11 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 从50帧历史中采样5帧，使用与act方法相同的健壮逻辑
         # 直接使用固定索引采样，然后重塑为图像格式
-        sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
-        sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
-        # sampled_height_maps = height_maps
+        # sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
+        # sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
+        sampled_height_maps = height_maps.squeeze(1)
         # 重塑为图像格式 [B, 5, H, W]
-        sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
+        # sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_actor(sampled_height_maps)
@@ -241,11 +241,11 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 从50帧历史中采样5帧，使用与act方法相同的健壮逻辑
         # 直接使用固定索引采样，然后重塑为图像格式
-        sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
-        sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
-        # sampled_height_maps = height_maps
+        # sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
+        # sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
+        sampled_height_maps = height_maps.squeeze(1)
         # 重塑为图像格式 [B, 5, H, W]
-        sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
+        # sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_critic(sampled_height_maps)

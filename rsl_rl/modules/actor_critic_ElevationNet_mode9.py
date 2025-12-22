@@ -51,6 +51,8 @@ class Conv2DElevationEncoder(nn.Module):
 
     def forward(self, x):
         # x: [B, 5, 25, 17]
+        x_mean = x.mean(dim = (-1, -2), keepdim=True)
+        x = torch.clip((x -x_mean) / 0.1, -3.0, 3.0) # 简陋的归一化
         x = self.conv(x)
         x = x.flatten(1)
         x = self.fc(x)
@@ -182,7 +184,7 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 从50帧历史中采样5帧，使用更健壮的采样逻辑
         # 直接使用固定索引采样，然后重塑为图像格式
-        sampled_indices = [0, 10, 20, 30, 40]  # 从最新帧开始，每隔10帧采样
+        sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
         sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
         # sampled_height_maps = height_maps
         # 重塑为图像格式 [B, 5, H, W]
@@ -211,7 +213,7 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 从50帧历史中采样5帧，使用与act方法相同的健壮逻辑
         # 直接使用固定索引采样，然后重塑为图像格式
-        sampled_indices = [0, 10, 20, 30, 40]
+        sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
         sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
         # sampled_height_maps = height_maps
         # 重塑为图像格式 [B, 5, H, W]
@@ -239,7 +241,7 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 从50帧历史中采样5帧，使用与act方法相同的健壮逻辑
         # 直接使用固定索引采样，然后重塑为图像格式
-        sampled_indices = [0, 10, 20, 30, 40]
+        sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
         sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
         # sampled_height_maps = height_maps
         # 重塑为图像格式 [B, 5, H, W]
@@ -397,7 +399,7 @@ class _ElevationNetMode9OnnxPolicyExporter(torch.nn.Module):
         height_maps = elevation_data.view(batch_size, history_frames, height, width)
         
         # 采样5帧
-        sampled_height_maps = height_maps[:, [0,10,20,30,40], :].squeeze(1).view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
+        sampled_height_maps = height_maps[:, [9, 19, 29, 39, 49], :].view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
         
         # 提取特征
         vision_features = self.elevation_encoder(sampled_height_maps)

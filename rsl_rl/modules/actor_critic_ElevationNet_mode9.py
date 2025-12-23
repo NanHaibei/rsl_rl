@@ -31,28 +31,38 @@ class Conv2DElevationEncoder(nn.Module):
     将5帧高程图作为5个通道处理，类似于多通道图像
     """
     
-    def __init__(self, out_dim=64):
+    def __init__(self, 
+                 num_frames=5,
+                 hidden_dims=[16, 32, 64],
+                 kernel_sizes=[3, 3, 3],
+                 strides=[2, 2, 2],
+                 out_dim=64,
+                 vision_spatial_size=(25, 17)):
         super().__init__()
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(5, 16, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-        )
-
-        # 计算经过CNN后的特征维度
-        # 输入: [B, 5, 25, 17] -> conv后 -> [B, 64, H', W'] 
-        # 经过3次stride=2的卷积: 25->13->7->4, 17->9->5->3
-        conv_output_size = 64 * 4 * 3  # 64 channels * 4 * 3 spatial size
+        
+        # 动态构建卷积层
+        layers = []
+        in_channels = num_frames
+        
+        for i, (hidden_dim, kernel_size, stride) in enumerate(zip(hidden_dims, kernel_sizes, strides)):
+            layers.append(nn.Conv2d(in_channels, hidden_dim, kernel_size=kernel_size, stride=stride, padding=kernel_size//2))
+            layers.append(nn.ReLU())
+            in_channels = hidden_dim
+        
+        self.conv = nn.Sequential(*layers)
+        
+        # 计算经过CNN后的特征维度（通过前向传播计算）
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, num_frames, vision_spatial_size[0], vision_spatial_size[1])
+            dummy_output = self.conv(dummy_input)
+            conv_output_size = dummy_output.numel()
+        
         self.fc = nn.Linear(conv_output_size, out_dim)
 
     def forward(self, x):
         # x: [B, 5, 25, 17]
         x_mean = x.mean(dim = (-1, -2), keepdim=True)
-        x = torch.clip((x -x_mean) / 0.1, -3.0, 3.0) # 简陋的归一化
+        x = torch.clip((x - x_mean) / 0.1, -5.0, 5.0) # 简陋的归一化
         x = self.conv(x)
         x = x.flatten(1)
         x = self.fc(x)
@@ -85,7 +95,6 @@ class ActorCriticElevationNetMode9(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         # 高程图编码器配置
-        elevation_history_length: int = 50,
         elevation_sampled_frames: int = 5,
         vision_spatial_size: tuple[int, int] = (25, 17),
         vision_feature_dim: int = 64,
@@ -102,7 +111,6 @@ class ActorCriticElevationNetMode9(nn.Module):
         self.obs_groups = obs_groups
         self.vision_spatial_size = vision_spatial_size
         self.noise_std_type = noise_std_type
-        self.elevation_history_length = elevation_history_length
         self.elevation_sampled_frames = elevation_sampled_frames
         self.vision_feature_dim = vision_feature_dim
         
@@ -113,12 +121,26 @@ class ActorCriticElevationNetMode9(nn.Module):
         ########################################## 网络架构 ##############################################
         
         # 1. Actor网络
-        self.elevation_encoder_actor = Conv2DElevationEncoder()
-        self.actor = MLP(num_actor_obs + 64, num_actions, actor_hidden_dims, activation)
+        self.elevation_encoder_actor = Conv2DElevationEncoder(
+            num_frames=elevation_sampled_frames,
+            hidden_dims=conv2d_hidden_dims,
+            kernel_sizes=conv2d_kernel_sizes,
+            strides=[2] * len(conv2d_hidden_dims),  # 默认使用stride=2
+            out_dim=vision_feature_dim,
+            vision_spatial_size=vision_spatial_size
+        )
+        self.actor = MLP(num_actor_obs + vision_feature_dim, num_actions, actor_hidden_dims, activation)
         
         # 2. Critic网络
-        self.elevation_encoder_critic = Conv2DElevationEncoder()
-        self.critic = MLP(num_critic_obs + 64, 1, critic_hidden_dims, activation)
+        self.elevation_encoder_critic = Conv2DElevationEncoder(
+            num_frames=elevation_sampled_frames,
+            hidden_dims=conv2d_hidden_dims,
+            kernel_sizes=conv2d_kernel_sizes,
+            strides=[2] * len(conv2d_hidden_dims),  # 默认使用stride=2
+            out_dim=vision_feature_dim,
+            vision_spatial_size=vision_spatial_size
+        )
+        self.critic = MLP(num_critic_obs + vision_feature_dim, 1, critic_hidden_dims, activation)
 
         # Actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -145,6 +167,13 @@ class ActorCriticElevationNetMode9(nn.Module):
         # Action distribution
         self.distribution = None
         Normal.set_default_validate_args(False)
+        
+        # 打印网络结构
+        print("\n" + "="*80)
+        print("ActorCriticElevationNetMode9 网络结构")
+        print("="*80)
+        print(self)
+        print("="*80 + "\n")
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         pass
@@ -182,13 +211,8 @@ class ActorCriticElevationNetMode9(nn.Module):
         # 应用观测归一化
         current_proprio_obs = self.actor_obs_normalizer(current_proprio_obs)
         
-        # 2. 从50帧历史中采样5帧，使用更健壮的采样逻辑
-        # 直接使用固定索引采样，然后重塑为图像格式
-        # sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
-        # sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
-        sampled_height_maps = height_maps.squeeze(1)  # [B, 50, H, W]
-        # 重塑为图像格式 [B, 5, H, W]
-        # sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
+        # 2. 整理高程图格式
+        sampled_height_maps = height_maps.squeeze(1)
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_actor(sampled_height_maps)
@@ -211,13 +235,10 @@ class ActorCriticElevationNetMode9(nn.Module):
         # 应用观测归一化
         current_proprio_obs = self.actor_obs_normalizer(current_proprio_obs)
         
-        # 2. 从50帧历史中采样5帧，使用与act方法相同的健壮逻辑
-        # 直接使用固定索引采样，然后重塑为图像格式
-        # sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
-        # sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
+        # 2. 整理高程图格式
         sampled_height_maps = height_maps.squeeze(1)
-        # 重塑为图像格式 [B, 5, H, W]
-        # sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
+
+        # print(sampled_height_maps[34,0,:,:])
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_actor(sampled_height_maps)
@@ -239,13 +260,8 @@ class ActorCriticElevationNetMode9(nn.Module):
         # 应用观测归一化
         current_proprio_obs = self.critic_obs_normalizer(current_proprio_obs)
         
-        # 2. 从50帧历史中采样5帧，使用与act方法相同的健壮逻辑
-        # 直接使用固定索引采样，然后重塑为图像格式
-        # sampled_indices = [9, 19, 29, 39, 49]  # 从最新帧开始，每隔10帧采样
-        # sampled_height_maps = height_maps[:, sampled_indices, :]  # [B, 5, H*W]
+        # 2. 整理高程图格式
         sampled_height_maps = height_maps.squeeze(1)
-        # 重塑为图像格式 [B, 5, H, W]
-        # sampled_height_maps = sampled_height_maps.view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_critic(sampled_height_maps)

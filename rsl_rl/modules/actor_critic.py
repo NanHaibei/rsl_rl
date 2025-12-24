@@ -261,7 +261,18 @@ class _OnnxPolicyExporter(torch.nn.Module):
         self.to("cpu")
         self.eval()
         opset_version = 18
-        obs = torch.zeros(1, self.normalizer.in_features)
+        # 获取normalizer的输入维度
+        if hasattr(self.normalizer, '_mean'):
+            # EmpiricalNormalization的情况，_mean的shape是(1, n_features)
+            obs_dim = self.normalizer._mean.shape[1]
+        elif hasattr(self.normalizer, 'in_features'):
+            # 标准归一化层的情况
+            obs_dim = self.normalizer.in_features
+        else:
+            # Identity或其他情况，使用actor的输入维度
+            obs_dim = self.actor[0].in_features if isinstance(self.actor, torch.nn.Sequential) else self.actor.in_features
+        
+        obs = torch.zeros(1, obs_dim)
         torch.onnx.export(
             self,
             obs,

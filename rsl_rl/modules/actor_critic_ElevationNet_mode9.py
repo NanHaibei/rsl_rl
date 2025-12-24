@@ -241,11 +241,6 @@ class ActorCriticElevationNetMode9(nn.Module):
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_actor(sampled_height_maps)
         
-        # # 打印vision_features统计信息
-        # print(f"vision_features - 均值: {vision_features[0,:].mean().item():.6f}, "
-        #       f"最大值: {vision_features[0,:].max().item():.6f}, "
-        #       f"最小值: {vision_features[0,:].min().item():.6f}")
-        
         # 4. 融合特征
         fused_features = torch.cat((vision_features, current_proprio_obs), dim=-1)
         
@@ -377,51 +372,34 @@ class _ElevationNetMode9OnnxPolicyExporter(torch.nn.Module):
         else:
             self.normalizer = torch.nn.Identity()
 
-    def _sample_elevation_frames_onnx(self, height_maps: torch.Tensor) -> torch.Tensor:
-        """ONNX导出器的高程图采样函数（简化版）
+    def forward(self, obs_input):
+        """前向传播（单输入版本）
         
         Args:
-            height_maps: 输入高程图历史 [batch_size, 50, height, width]
-            
+            obs_input: 合并的观测数据，形状为 [batch_size, total_obs_dim]
+                       前 proprio_obs_dim 维是本体观测
+                       后面是展平的高程图数据（需要reshape为 [B, sampled_frames, height, width]）
+        
         Returns:
-            采样后的高程图 [batch_size, 5, height, width]
+            actions_mean: 动作均值，形状为 [batch_size, num_actions]
         """
-        batch_size, history_length, height, width = height_maps.shape
+        batch_size = obs_input.shape[0]
         
-        # 简化采样：取前5帧（在实际部署中应该实现完整的采样逻辑）
-        # 这里为了ONNX兼容性，使用固定的采样索引
-        sampled_frames = height_maps[:, ::10, :, :]  # 每隔10帧取一帧
-        if sampled_frames.shape[1] > 5:
-            sampled_frames = sampled_frames[:, :5, :, :]
-        elif sampled_frames.shape[1] < 5:
-            # 如果不足5帧，重复最后一帧
-            last_frame = sampled_frames[:, -1:, :, :]
-            padding = 5 - sampled_frames.shape[1]
-            sampled_frames = torch.cat([sampled_frames, last_frame.repeat(1, padding, 1, 1)], dim=1)
+        # 切片分离本体观测和高程图数据
+        proprio_data = obs_input[:, :self.proprio_obs_dim]
+        elevation_data_flat = obs_input[:, self.proprio_obs_dim:]
         
-        return sampled_frames
-
-    def forward(self, x):
-        # 输入需要包含高程图序列数据和本体观测数据
-        # 这里简化处理，实际使用时需要根据具体输入格式调整
-        batch_size = x.shape[0]
-        
-        # 分离高程图和本体观测（假设输入格式为[高程图展平, 本体观测]）
+        # 将高程图数据reshape为 [B, sampled_frames, height, width]
         height, width = self.vision_spatial_size
-        # 假设输入包含50帧历史数据
-        history_frames = 50
-        elevation_dim = history_frames * height * width
-        elevation_data = x[:, :elevation_dim]  # 高程图数据
-        proprio_data = x[:, elevation_dim:elevation_dim + self.proprio_obs_dim]  # 本体观测数据
+        elevation_data = elevation_data_flat.reshape(
+            batch_size, self.elevation_sampled_frames, height, width
+        )
         
-        # 重塑高程图数据为50帧历史
-        height_maps = elevation_data.view(batch_size, history_frames, height, width)
+        # 应用归一化器到本体观测（与act函数一致）
+        proprio_data = self.normalizer(proprio_data)
         
-        # 采样5帧
-        sampled_height_maps = height_maps[:, [9, 19, 29, 39, 49], :].view(-1, 5, self.vision_spatial_size[0], self.vision_spatial_size[1])
-        
-        # 提取特征
-        vision_features = self.elevation_encoder(sampled_height_maps)
+        # 提取视觉特征
+        vision_features = self.elevation_encoder(elevation_data)
         
         # 融合特征
         fused_features = torch.cat([vision_features, proprio_data], dim=-1)
@@ -434,15 +412,30 @@ class _ElevationNetMode9OnnxPolicyExporter(torch.nn.Module):
         self.to("cpu")
         self.eval()
         opset_version = 18
-        # 创建输入示例 - 使用50帧历史数据
+        
+        # 计算维度
         height, width = self.vision_spatial_size
-        history_frames = 50  # 使用完整的历史帧数
-        elevation_dim = history_frames * height * width  # 50帧高程图数据
-        total_dim = elevation_dim + self.proprio_obs_dim
-        obs = torch.zeros(1, total_dim)
+        sampled_frames = self.elevation_sampled_frames
+        elevation_dim = sampled_frames * height * width
+        total_obs_dim = self.proprio_obs_dim + elevation_dim
+        
+        # 创建单个合并的输入示例
+        # 格式: [本体观测(102维) + 展平的高程图(5*25*17=2125维)] = 2227维
+        obs_input = torch.zeros(1, total_obs_dim)
+        
+        print(f"\n{'='*80}")
+        print(f"ONNX导出配置 (单输入模式):")
+        print(f"{'='*80}")
+        print(f"  本体观测维度:     {self.proprio_obs_dim}")
+        print(f"  高程图维度:       {elevation_dim} ({sampled_frames}×{height}×{width})")
+        print(f"  总输入维度:       {total_obs_dim}")
+        print(f"  输入切片方式:     [:, :{self.proprio_obs_dim}] = 本体, "
+              f"[:, {self.proprio_obs_dim}:] = 高程图")
+        print(f"{'='*80}\n")
+        
         torch.onnx.export(
             self,
-            obs,
+            obs_input,
             os.path.join(path, filename),
             export_params=True,
             opset_version=opset_version,

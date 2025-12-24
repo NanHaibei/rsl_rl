@@ -232,14 +232,19 @@ class OnPolicyRunner:
             if it == start_iter and not self.disable_logs:
                 # Obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # If possible store them to wandb or neptune
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                # If possible store them to wandb, neptune or swanlab
+                if self.logger_type in ["wandb", "neptune", "swanlab"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            
+            # Finish logging for wandb and swanlab to show as completed instead of interrupted
+            if self.logger_type in ["wandb", "swanlab"] and self.writer is not None:
+                if hasattr(self.writer, "stop"):
+                    self.writer.stop()
 
     def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
         # Compute the collection size
@@ -305,7 +310,7 @@ class OnPolicyRunner:
             # Everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
-            if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
+            if self.logger_type not in ["wandb", "swanlab"]:  # wandb and swanlab do not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
@@ -393,7 +398,7 @@ class OnPolicyRunner:
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
+        if self.logger_type in ["neptune", "wandb", "swanlab"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None) -> dict:
@@ -578,9 +583,14 @@ class OnPolicyRunner:
 
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+            elif self.logger_type == "swanlab":
+                from rsl_rl.utils.swanlab_utils import SwanlabSummaryWriter
+
+                self.writer = SwanlabSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
 
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
-                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb', 'swanlab' or 'tensorboard'.")

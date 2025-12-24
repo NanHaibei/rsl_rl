@@ -141,8 +141,8 @@ class DistillationRunner(OnPolicyRunner):
             if it == start_iter and not self.disable_logs:
                 # Obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # If possible store them to wandb or neptune
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                # If possible store them to wandb, neptune or swanlab
+                if self.logger_type in ["wandb", "neptune", "swanlab"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 

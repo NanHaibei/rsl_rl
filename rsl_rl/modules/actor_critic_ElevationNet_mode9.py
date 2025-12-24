@@ -237,11 +237,14 @@ class ActorCriticElevationNetMode9(nn.Module):
         
         # 2. 整理高程图格式
         sampled_height_maps = height_maps.squeeze(1)
-
-        # print(sampled_height_maps[34,0,:,:])
         
         # 3. 提取高程图特征
         vision_features = self.elevation_encoder_actor(sampled_height_maps)
+        
+        # # 打印vision_features统计信息
+        # print(f"vision_features - 均值: {vision_features[0,:].mean().item():.6f}, "
+        #       f"最大值: {vision_features[0,:].max().item():.6f}, "
+        #       f"最小值: {vision_features[0,:].min().item():.6f}")
         
         # 4. 融合特征
         fused_features = torch.cat((vision_features, current_proprio_obs), dim=-1)

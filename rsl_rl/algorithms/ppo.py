@@ -196,7 +196,7 @@ class PPO:
             # 保存原始 task reward
             self.task_rewards = rewards.clone()
             
-            # 使用 self.transition.observations 作为当前观测，obs 参数作为下一个观测
+            # 记录AMP观测 TODO
             amp_obs = self.transition.observations["amp"]
             next_amp_obs = self.transition.next_observations["amp"]
             
@@ -207,8 +207,18 @@ class PPO:
             
             # 使用 final reward 作为最终奖励
             rewards = self.final_rewards
-            # 保存amp policy观测值
-            self.amp_storage.insert(amp_obs, next_amp_obs)
+            # 保存amp policy观测值，但排除已done的环境
+            # 只有未done的环境才是有效的transition，done的环境会被重置
+            if dones.any():
+                # 使用mask来过滤掉done的环境
+                not_done_mask = ~dones
+                valid_amp_obs = amp_obs[not_done_mask]
+                valid_next_amp_obs = next_amp_obs[not_done_mask]
+                if valid_amp_obs.shape[0] > 0:  # 如果有未done的环境
+                    self.amp_storage.insert(valid_amp_obs, valid_next_amp_obs)
+            else:
+                # 如果没有环境done，正常插入
+                self.amp_storage.insert(amp_obs, next_amp_obs)
         else:
             self.task_rewards = None
             self.style_rewards = None

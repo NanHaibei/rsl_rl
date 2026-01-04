@@ -246,6 +246,10 @@ class PPO:
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
+        
+        # 如果policy支持AdaBoot，传递rewards和dones用于内部追踪
+        if hasattr(self.policy, 'update_adaboot_rewards'):
+            self.policy.update_adaboot_rewards(rewards, dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
         # Compute value for the last step

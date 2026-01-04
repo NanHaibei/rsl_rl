@@ -31,6 +31,7 @@ from rsl_rl.modules import (
     ActorCriticElevationNetMode7,
     ActorCriticElevationNetMode8,
     ActorCriticElevationNetMode9,
+    ActorCriticElevationNetMode9A,
     ActorCriticElevationNetMode10,
     # ActorCritic_DeltaSine,
     AMPDiscriminator,
@@ -55,6 +56,7 @@ ActorCriticType = (
     | ActorCriticElevationNetMode7
     | ActorCriticElevationNetMode8
     | ActorCriticElevationNetMode9
+    | ActorCriticElevationNetMode9A
     | ActorCriticElevationNetMode10
 )
 

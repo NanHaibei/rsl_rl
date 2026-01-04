@@ -220,17 +220,6 @@ class ActorCriticElevationNetMode10(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _extract_height_map_sequence(self, obs: TensorDict) -> torch.Tensor:
-        """提取高程图序列用于2D CNN处理（历史帧作为通道）"""
-        depth_obs = obs["height_scan_history"]
-        while isinstance(depth_obs, TensorDict):
-            keys = list(depth_obs.keys())
-            depth_obs = depth_obs[keys[0]]
-        
-        # depth_obs 形状: [batch_size, history_frames, height, width]
-        # 这个形状适合Conv2DEncoder处理（历史帧将作为通道）
-        return depth_obs
-
     def reparameterise(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """重参数化技巧"""
         std = torch.exp(logvar * 0.5)
@@ -339,7 +328,7 @@ class ActorCriticElevationNetMode10(nn.Module):
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         """评估状态价值"""
         # 1. 提取观测值
-        height_maps_obs = obs["height_scan_history"]
+        height_maps_obs = obs["height_scan_critic"]
         current_critic_obs = self.get_critic_obs(obs)
         
         # 应用观测归一化
@@ -426,7 +415,7 @@ class ActorCriticElevationNetMode10(nn.Module):
         obs_target.requires_grad = False
 
         # 损失计算：速度重建损失 + obs重建损失 + KL散度损失
-        vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 100.0
+        vel_MSE = nn.MSELoss()(vel_sample, vel_target)
         # 确保decode和obs_target维度匹配
         obs_MSE = nn.MSELoss()(decode, obs_target)
         dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))

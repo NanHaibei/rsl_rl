@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9, ActorCriticElevationNetMode10
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9, ActorCriticElevationNetMode9A, ActorCriticElevationNetMode10
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -22,7 +22,7 @@ from rsl_rl.utils import AMPLoader
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode10
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10
     """The actor critic module."""
 
     def __init__(
@@ -102,7 +102,7 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode10 = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ或ElevationNetMode2A/3/4/5/6
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False

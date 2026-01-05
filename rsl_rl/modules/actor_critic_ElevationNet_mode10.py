@@ -28,6 +28,7 @@ from torch.distributions import Normal
 from typing import Any, NoReturn
 import numpy as np
 
+from rsl_rl import env
 from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
 import os
@@ -47,25 +48,31 @@ class AdaBootManager:
         episodic_rewards_buffer: episode奖励缓冲区
     """
     
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict | None = None, env_cfg=None) -> None:
         """初始化AdaBoot管理器"""
 
         self.warmup_iterations = config["warmup_iterations"]
         self.cv_scale = config["cv_scale"]
+        self.type = config["type"]
         self.current_iteration = 0  # 当前训练迭代次数
-        self.p_boot = 0.0
+        self.probability = 0.0  # 当前bootstrap概率
         
-        # 累积当前episode的奖励
-        self.episodic_rewards_buffer = torch.zeros(
-            config["num_envs"], dtype=torch.float32, device=config["device"]
-        )
-        
-        # 存储本次rollout中完成的episodes的总奖励
-        self.completed_episodes_rewards = []
+        # 区分三种不同的boot模式
+        if self.type == "CV":
+            self.episodic_rewards_buffer = torch.zeros(config["num_envs"], dtype=torch.float32, device=config["device"])
+            self.completed_episodes_rewards = []             # 存储本次rollout中完成的episodes的总奖励
+        elif self.type == "terrain":
+            self.now_terrain_level = 0.0
+            self.max_terrain_level = config["max_terrain_level"]
+        elif self.type == "xyVel":
+            self.now_tracking_reward = 0.0
+            self.max_tracking_reward = env_cfg.rewards.track_lin_vel_xy_exp.weight * config["max_tracking_ratio"]
+        else:
+            raise ValueError(f"Unknown AdaBoot type: {self.type}")
         
         print(f"[AdaBoot] 已启用 - 预热迭代: {self.warmup_iterations}, CV缩放: {self.cv_scale}")
     
-    def update_rewards(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
+    def update_data(self, rewards: torch.Tensor, dones: torch.Tensor, extras) -> None:
         """更新episode奖励（在每个环境step时调用）
         
         Args:
@@ -73,16 +80,21 @@ class AdaBootManager:
             dones: 环境是否完成 [num_envs]
         """
         
-        # 累加所有环境的奖励
-        self.episodic_rewards_buffer += rewards
-        
-        # 对于done的环境，保存完整的episode奖励到列表（向量化操作）
-        if dones.any():
-            done_rewards = self.episodic_rewards_buffer[dones].tolist()
-            self.completed_episodes_rewards.extend(done_rewards)
+        if self.type == "CV":
+            # 累加所有环境的奖励
+            self.episodic_rewards_buffer += rewards
             
-            # 重置done环境的累积奖励
-            self.episodic_rewards_buffer[dones] = 0.0
+            # 对于done的环境，保存完整的episode奖励到列表（向量化操作）
+            if dones.any():
+                done_rewards = self.episodic_rewards_buffer[dones].tolist()
+                self.completed_episodes_rewards.extend(done_rewards)
+                
+                # 重置done环境的累积奖励
+                self.episodic_rewards_buffer[dones] = 0.0
+        elif self.type == "terrain":
+            self.now_terrain_level = extras["log"]["Curriculum/terrain_levels"]
+        elif self.type == "xyVel":
+            self.now_tracking_reward = extras["log"]["Episode_Reward/track_lin_vel_xy_exp"]
 
     
     def update_iteration(self) -> None:
@@ -92,35 +104,39 @@ class AdaBootManager:
         """
         
         self.current_iteration += 1
-        
         # 预热期：强制不使用bootstrap
         if self.current_iteration <= self.warmup_iterations:
-            self.p_boot = 0.0
+            self.probability = 0.0
+            if self.type == "CV":
+                self.completed_episodes_rewards.clear()
+            return
+            
+        if self.type == "CV":
+            # 需要至少有一些完成的episodes才能计算CV
+            if len(self.completed_episodes_rewards) < 10:
+                self.probability = 0.0
+                return
+            
+            # 计算CV (Coefficient of Variation)
+            rewards_array = torch.tensor(self.completed_episodes_rewards, dtype=torch.float32)
+            mean_reward = torch.mean(rewards_array).item()
+            std_reward = torch.std(rewards_array, unbiased=False).item()
+            
+            # 避免除以零
+            cv = std_reward / (abs(mean_reward) + 1e-6)
+            
+            # 计算bootstrap概率: probability = 1 - tanh(CV * scale)
+            self.probability = float(torch.clip(
+                1.0 - torch.tanh(torch.tensor(cv * self.cv_scale)), 0.0, 1.0).item())
+            
+            # 清空本次rollout的统计数据
             self.completed_episodes_rewards.clear()
-            return
-        
-        # 需要至少有一些完成的episodes才能计算CV
-        if len(self.completed_episodes_rewards) < 10:
-            self.p_boot = 0.0
-            return
-        
-        # 计算CV (Coefficient of Variation)
-        rewards_array = torch.tensor(self.completed_episodes_rewards, dtype=torch.float32)
-        mean_reward = torch.mean(rewards_array).item()
-        std_reward = torch.std(rewards_array, unbiased=False).item()
-        
-        # 避免除以零
-        cv = std_reward / (abs(mean_reward) + 1e-6)
-        
-        # 计算bootstrap概率: p_boot = 1 - tanh(CV * scale)
-        self.p_boot = float(torch.clip(
-            1.0 - torch.tanh(torch.tensor(cv * self.cv_scale)), 
-            0.0, 
-            1.0
-        ).item())
-        
-        # 清空本次rollout的统计数据
-        self.completed_episodes_rewards.clear()
+        elif self.type == "terrain":
+            self.probability = float(torch.clip(
+                torch.tensor(self.now_terrain_level / self.max_terrain_level), 0.0, 1.0).item())
+        elif self.type == "xyVel":
+            self.probability = float(torch.clip(
+                torch.tensor(self.now_tracking_reward / self.max_tracking_reward), 0.0, 1.0).item())
     
     def should_use_estimate(self) -> bool:
         """决定是否使用估计值（bootstrap）
@@ -132,8 +148,7 @@ class AdaBootManager:
         """
         
         # 根据当前概率随机采样
-        use_estimate = torch.rand(1).item() < self.p_boot
-        return use_estimate
+        return torch.rand(1).item() < self.probability
     
     def get_stats(self) -> dict[str, float]:
         """获取AdaBoot统计信息
@@ -142,23 +157,38 @@ class AdaBootManager:
             包含统计信息的字典
         """
         
-        # 计算当前缓存的episodes统计（如果有）
-        if len(self.completed_episodes_rewards) > 0:
-            rewards_array = torch.tensor(self.completed_episodes_rewards, dtype=torch.float32)
-            mean_r = torch.mean(rewards_array).item()
-            std_r = torch.std(rewards_array, unbiased=False).item()
-            cv = std_r / (abs(mean_r) + 1e-6)
-        else:
-            mean_r = std_r = cv = 0.0
-        
         stats = {
-            "adaboot/p_boot": self.p_boot,
-            "adaboot/cv": cv,
-            "adaboot/mean_reward": mean_r,
-            "adaboot/std_reward": std_r,
+            "adaboot/probability": self.probability,
             "adaboot/iteration": float(self.current_iteration),
-            "adaboot/num_completed_episodes": float(len(self.completed_episodes_rewards))
         }
+        
+        # 根据不同模式添加特定的统计信息
+        if self.type == "CV":
+            # 计算当前缓存的episodes统计（如果有）
+            if len(self.completed_episodes_rewards) > 0:
+                rewards_array = torch.tensor(self.completed_episodes_rewards, dtype=torch.float32)
+                mean_r = torch.mean(rewards_array).item()
+                std_r = torch.std(rewards_array, unbiased=False).item()
+                cv = std_r / (abs(mean_r) + 1e-6)
+            else:
+                mean_r = std_r = cv = 0.0
+            
+            stats.update({
+                "adaboot/cv": cv,
+                "adaboot/mean_reward": mean_r,
+                "adaboot/std_reward": std_r,
+                "adaboot/num_completed_episodes": float(len(self.completed_episodes_rewards))
+            })
+        elif self.type == "terrain":
+            stats.update({
+                "adaboot/terrain_level": self.now_terrain_level,
+                "adaboot/max_terrain_level": self.max_terrain_level
+            })
+        elif self.type == "xyVel":
+            stats.update({
+                "adaboot/tracking_reward": self.now_tracking_reward,
+                "adaboot/max_tracking_reward": self.max_tracking_reward
+            })
         
         return stats
 
@@ -301,6 +331,7 @@ class ActorCriticElevationNetMode10(nn.Module):
         obs: TensorDict,
         obs_groups: dict[str, list[str]],
         num_actions: int,
+        env_cfg=None,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 128],
@@ -412,7 +443,7 @@ class ActorCriticElevationNetMode10(nn.Module):
             device = obs["policy"].device
             adaboot_cfg["num_envs"] = num_envs
             adaboot_cfg["device"] = device
-            self.adaboot_manager = AdaBootManager(adaboot_cfg) 
+            self.adaboot_manager = AdaBootManager(adaboot_cfg, env_cfg=env_cfg) 
         else:
             self.adaboot_manager = None
         

@@ -37,6 +37,7 @@ class ActorCriticElevationNetMode1(nn.Module):
         obs: TensorDict,
         obs_groups: dict[str, list[str]],
         num_actions: int,
+        env_cfg=None,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [768, 384, 128],

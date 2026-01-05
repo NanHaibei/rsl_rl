@@ -248,8 +248,8 @@ class PPO:
         self.policy.reset(dones)
         
         # 如果policy支持AdaBoot，传递rewards和dones用于内部追踪
-        if hasattr(self.policy, 'update_adaboot_rewards'):
-            self.policy.update_adaboot_rewards(rewards, dones)
+        if hasattr(self.policy, 'adaboot_manager') and self.policy.adaboot_manager is not None:
+            self.policy.adaboot_manager.update_rewards(rewards, dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
         # Compute value for the last step
@@ -571,6 +571,10 @@ class PPO:
             mean_expert_pred /= amp_divisor
         # Clear the storage
         self.storage.clear()
+        
+        # 在训练迭代结束后更新AdaBoot的bootstrap概率
+        if hasattr(self.policy, 'adaboot_manager') and self.policy.adaboot_manager is not None:
+            self.policy.adaboot_manager.update_iteration()
 
         # Construct the loss dictionary
         loss_dict = {

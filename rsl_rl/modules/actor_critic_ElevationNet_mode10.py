@@ -43,129 +43,84 @@ class AdaBootManager:
     - 后期训练（低方差）→ 高p_boot → 多用estimator增强鲁棒性
     
     Attributes:
-        use_adaboot: 是否启用AdaBoot
         warmup_iterations: 预热迭代次数
-        cv_scale: CV缩放因子
-        current_iteration: 当前迭代次数
-        probability: 当前bootstrap概率
         episodic_rewards_buffer: episode奖励缓冲区
-        cv_history: CV历史记录
-        use_estimate_count: 使用估计值的次数统计
-        use_ground_truth_count: 使用真实值的次数统计
     """
     
     def __init__(self, config: dict | None = None):
-        """初始化AdaBoot管理器
+        """初始化AdaBoot管理器"""
+
+        self.warmup_iterations = config["warmup_iterations"]
+        self.cv_scale = config["cv_scale"]
+        self.current_iteration = 0  # 当前训练迭代次数
+        self.p_boot = 0.0
         
-        Args:
-            config: 配置字典，包含use_adaboot, warmup_iterations, cv_scale
-        """
-        config = config or {}
-        self.use_adaboot = config.get('use_adaboot', False)
-        self.warmup_iterations = config.get('warmup_iterations', 0)
-        self.cv_scale = config.get('cv_scale', 1.0)
+        # 累积当前episode的奖励
+        self.episodic_rewards_buffer = torch.zeros(
+            config["num_envs"], dtype=torch.float32, device=config["device"]
+        )
         
-        # 运行时状态
-        self.current_iteration = 0
-        self.probability = 0.0
-        self.episodic_rewards_buffer = []
-        self.cv_history = []
+        # 存储本次rollout中完成的episodes的总奖励
+        self.completed_episodes_rewards = []
         
-        # 统计
-        self.use_estimate_count = 0
-        self.use_ground_truth_count = 0
-        
-        if self.use_adaboot:
-            print(f"[AdaBoot] 已启用 - 预热迭代: {self.warmup_iterations}, CV缩放: {self.cv_scale}")
-    
-    def init(self, num_envs: int, device: torch.device | None = None) -> None:
-        """初始化episode奖励缓冲区
-        
-        Args:
-            num_envs: 环境数量
-            device: 张量设备（默认为CPU）
-        """
-        if self.use_adaboot:
-            device = device or torch.device('cpu')
-            self.episodic_rewards_buffer = torch.zeros(num_envs, device=device)
-            print(f"[AdaBoot] 已初始化 {num_envs} 个环境的奖励缓冲区")
+        print(f"[AdaBoot] 已启用 - 预热迭代: {self.warmup_iterations}, CV缩放: {self.cv_scale}")
     
     def update_rewards(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
-        """更新episode奖励
+        """更新episode奖励（在每个环境step时调用）
         
         Args:
             rewards: 当前步的奖励 [num_envs]
-            dones: 当前步的done标志 [num_envs]
+            dones: 环境是否完成 [num_envs]
         """
-        if not self.use_adaboot:
-            return
         
-        # 将buffer转换为tensor（兼容性处理）
-        if isinstance(self.episodic_rewards_buffer, list):
-            self.episodic_rewards_buffer = torch.zeros(len(self.episodic_rewards_buffer), device=rewards.device)
-        
-        # 使用tensor操作累加奖励（高效）
+        # 累加所有环境的奖励
         self.episodic_rewards_buffer += rewards
+        
+        # 对于done的环境，保存完整的episode奖励到列表（向量化操作）
+        if dones.any():
+            done_rewards = self.episodic_rewards_buffer[dones].tolist()
+            self.completed_episodes_rewards.extend(done_rewards)
+            
+            # 重置done环境的累积奖励
+            self.episodic_rewards_buffer[dones] = 0.0
+
     
-    def compute_probability(self) -> float:
-        """计算bootstrap概率
+    def update_iteration(self) -> None:
+        """在每个训练迭代结束时调用，更新bootstrap概率
         
-        使用公式: p_boot = 1 - tanh(CV(R) * scale)
-        其中 CV = std(R) / |mean(R)|
-        
-        Returns:
-            bootstrap概率，范围[0, 1]
+        基于本次rollout中完成的episodes计算CV和p_boot
         """
-        if not self.use_adaboot:
-            return 0.0
         
         self.current_iteration += 1
         
-        # 预热期间不使用bootstrap
+        # 预热期：强制不使用bootstrap
         if self.current_iteration <= self.warmup_iterations:
-            self.probability = 0.0
-            return 0.0
+            self.p_boot = 0.0
+            self.completed_episodes_rewards.clear()
+            return
         
-        if len(self.episodic_rewards_buffer) == 0:
-            return 0.0
+        # 需要至少有一些完成的episodes才能计算CV
+        if len(self.completed_episodes_rewards) < 10:
+            self.p_boot = 0.0
+            return
         
-        # 计算变异系数 CV = std / |mean|
-        # 使用torch操作，避免CPU-GPU同步
-        if isinstance(self.episodic_rewards_buffer, torch.Tensor):
-            mean_reward = torch.mean(self.episodic_rewards_buffer).item()
-            std_reward = torch.std(self.episodic_rewards_buffer, unbiased=False).item()  # 匹配numpy默认行为
-        else:
-            # 向后兼容：如果是list，转为numpy
-            rewards_array = np.array(self.episodic_rewards_buffer)
-            mean_reward = np.mean(rewards_array)
-            std_reward = np.std(rewards_array)
+        # 计算CV (Coefficient of Variation)
+        rewards_array = torch.tensor(self.completed_episodes_rewards, dtype=torch.float32)
+        mean_reward = torch.mean(rewards_array).item()
+        std_reward = torch.std(rewards_array, unbiased=False).item()
         
-        # 计算CV，分母加1e-6避免除零
+        # 避免除以零
         cv = std_reward / (abs(mean_reward) + 1e-6)
         
-        # 应用缩放因子
-        cv_scaled = cv * self.cv_scale
+        # 计算bootstrap概率: p_boot = 1 - tanh(CV * scale)
+        self.p_boot = float(torch.clip(
+            1.0 - torch.tanh(torch.tensor(cv * self.cv_scale)), 
+            0.0, 
+            1.0
+        ).item())
         
-        # 计算bootstrap概率: p_boot = 1 - tanh(CV)
-        p_boot = 1.0 - np.tanh(cv_scaled)
-        p_boot = np.clip(p_boot, 0.0, 1.0)
-        
-        # 存储历史
-        self.cv_history.append(cv)
-        self.probability = p_boot
-        
-        return p_boot
-    
-    def reset_rewards(self) -> None:
-        """重置episode奖励缓冲区
-        
-        在每次rollout收集完成后调用
-        """
-        if self.use_adaboot and len(self.episodic_rewards_buffer) > 0:
-            if isinstance(self.episodic_rewards_buffer, torch.Tensor):
-                self.episodic_rewards_buffer.zero_()
-            else:
-                self.episodic_rewards_buffer = [0.0] * len(self.episodic_rewards_buffer)
+        # 清空本次rollout的统计数据
+        self.completed_episodes_rewards.clear()
     
     def should_use_estimate(self) -> bool:
         """决定是否使用估计值（bootstrap）
@@ -175,23 +130,9 @@ class AdaBootManager:
         Returns:
             True表示使用估计值，False表示使用真实值
         """
-        # 未启用AdaBoot时，使用估计值（保持原始Mode10行为）
-        if not self.use_adaboot:
-            self.use_estimate_count += 1
-            return True
         
-        # 启用AdaBoot但probability=0时（预热期或初始状态），使用真实值
-        # 这样可以在训练初期提供准确的ground truth信号
-        if self.probability == 0.0:
-            self.use_ground_truth_count += 1
-            return False
-        
-        # 正常情况：根据概率随机采样
-        use_estimate = torch.rand(1).item() < self.probability
-        if use_estimate:
-            self.use_estimate_count += 1
-        else:
-            self.use_ground_truth_count += 1
+        # 根据当前概率随机采样
+        use_estimate = torch.rand(1).item() < self.p_boot
         return use_estimate
     
     def get_stats(self) -> dict[str, float]:
@@ -200,51 +141,24 @@ class AdaBootManager:
         Returns:
             包含统计信息的字典
         """
-        if not self.use_adaboot:
-            return {}
         
-        # Policy使用统计
-        total_count = self.use_estimate_count + self.use_ground_truth_count
-        if total_count > 0:
-            estimate_ratio = self.use_estimate_count / total_count
+        # 计算当前缓存的episodes统计（如果有）
+        if len(self.completed_episodes_rewards) > 0:
+            rewards_array = torch.tensor(self.completed_episodes_rewards, dtype=torch.float32)
+            mean_r = torch.mean(rewards_array).item()
+            std_r = torch.std(rewards_array, unbiased=False).item()
+            cv = std_r / (abs(mean_r) + 1e-6)
         else:
-            estimate_ratio = 0.0
+            mean_r = std_r = cv = 0.0
         
         stats = {
-            "adaboot/probability": self.probability,
-            "adaboot/current_iteration": self.current_iteration,
-            "adaboot/policy_use_estimate_ratio": estimate_ratio,
-            "adaboot/policy_use_estimate_count": self.use_estimate_count,
-            "adaboot/policy_use_ground_truth_count": self.use_ground_truth_count,
+            "adaboot/p_boot": self.p_boot,
+            "adaboot/cv": cv,
+            "adaboot/mean_reward": mean_r,
+            "adaboot/std_reward": std_r,
+            "adaboot/iteration": float(self.current_iteration),
+            "adaboot/num_completed_episodes": float(len(self.completed_episodes_rewards))
         }
-        
-        # 如果有episode奖励数据，添加统计
-        if len(self.episodic_rewards_buffer) > 0:
-            if isinstance(self.episodic_rewards_buffer, torch.Tensor):
-                # 使用torch操作，避免CPU-GPU同步
-                mean_reward = torch.mean(self.episodic_rewards_buffer).item()
-                std_reward = torch.std(self.episodic_rewards_buffer, unbiased=False).item()  # 匹配numpy默认行为
-            else:
-                # 向后兼容：如果是list，使用numpy
-                rewards_array = np.array(self.episodic_rewards_buffer)
-                mean_reward = np.mean(rewards_array)
-                std_reward = np.std(rewards_array)
-            
-            stats["adaboot/mean_episode_reward"] = mean_reward
-            stats["adaboot/std_episode_reward"] = std_reward
-            
-            # 计算CV，分母加1e-6避免除零
-            cv = std_reward / (abs(mean_reward) + 1e-6)
-            stats["adaboot/cv"] = cv
-        
-        # 添加CV历史的统计（最近10个）
-        if len(self.cv_history) > 0:
-            recent_cv = self.cv_history[-10:]
-            stats["adaboot/cv_mean_recent"] = np.mean(recent_cv)
-        
-        # 重置计数器
-        self.use_estimate_count = 0
-        self.use_ground_truth_count = 0
         
         return stats
 
@@ -410,12 +324,12 @@ class ActorCriticElevationNetMode10(nn.Module):
         num_latent: int = 19,
         num_decode: int = 70,
         VAE_beta: float = 1.0,
+        adaboot_cfg: dict | None = None,
         **kwargs: dict[str, Any],
     ) -> None:
         super().__init__()
 
         # 配置
-        self.cfg = kwargs
         self.extra_info = dict()
         self.obs_groups = obs_groups
         self.vision_spatial_size = vision_spatial_size
@@ -492,9 +406,15 @@ class ActorCriticElevationNetMode10(nn.Module):
         self.distribution = None
         Normal.set_default_validate_args(False)
         
-        # AdaBoot管理器 - 从 kwargs 中提取配置并创建管理器
-        adaboot_cfg = kwargs.get('adaboot_cfg', {})
-        self.adaboot_manager = AdaBootManager(adaboot_cfg)
+        # AdaBoot管理器
+        if adaboot_cfg is not None:
+            num_envs = obs.shape[0]
+            device = obs["policy"].device
+            adaboot_cfg["num_envs"] = num_envs
+            adaboot_cfg["device"] = device
+            self.adaboot_manager = AdaBootManager(adaboot_cfg) 
+        else:
+            self.adaboot_manager = None
         
         # 打印网络结构
         print("\n" + "="*80)
@@ -560,53 +480,6 @@ class ActorCriticElevationNetMode10(nn.Module):
         
         return code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar
 
-    def init_adaboot(self, num_envs: int) -> None:
-        """初始化AdaBoot的episode奖励缓冲区
-        
-        Args:
-            num_envs: 环境数量
-        """
-        self.adaboot_manager.init(num_envs)
-
-    def update_adaboot_rewards(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
-        """更新AdaBoot的episode奖励
-        
-        自动进行懒加载初始化
-        
-        Args:
-            rewards: 当前步的奖励 [num_envs]
-            dones: 当前步的done标志 [num_envs]
-        """
-        # 懒加载：第一次调用时自动初始化
-        if self.adaboot_manager.use_adaboot and len(self.adaboot_manager.episodic_rewards_buffer) == 0:
-            num_envs = len(rewards)
-            self.adaboot_manager.init(num_envs, device=rewards.device)
-        
-        self.adaboot_manager.update_rewards(rewards, dones)
-
-    def compute_adaboot_probability(self) -> float:
-        """计算AdaBoot的bootstrap概率
-        
-        Returns:
-            bootstrap概率，范围[0, 1]
-        """
-        return self.adaboot_manager.compute_probability()
-
-    def reset_adaboot_episodic_rewards(self) -> None:
-        """重置AdaBoot的episode奖励缓冲区
-        
-        在每次rollout收集完成后调用
-        """
-        self.adaboot_manager.reset_rewards()
-
-    def get_adaboot_stats(self) -> dict[str, float]:
-        """获取AdaBoot统计信息
-        
-        Returns:
-            包含统计信息的字典
-        """
-        return self.adaboot_manager.get_stats()
-
     def _update_distribution(self, mean: torch.Tensor) -> None:
         """更新动作分布"""
         if self.noise_std_type == "scalar":
@@ -637,7 +510,7 @@ class ActorCriticElevationNetMode10(nn.Module):
         now_obs = proprio_obs_normalized[:, 0:self.num_proprio_one_frame]  # 当前观测
         
         # 由AdaBoot管理器决定是否使用估计值
-        use_estimate = self.adaboot_manager.should_use_estimate()
+        use_estimate = True if self.adaboot_manager is None else self.adaboot_manager.should_use_estimate()
         
         if use_estimate:
             # 使用estimator的估计值（训练estimator）
@@ -648,7 +521,7 @@ class ActorCriticElevationNetMode10(nn.Module):
             critic_obs_normalized = self.critic_obs_normalizer(critic_obs)
             real_velocity = critic_obs_normalized[:, 0:3]  # 提取真实速度
             # 拼接真实速度、latent均值和当前观测
-            real_code = torch.cat((real_velocity, latent_mean.detach()), dim=-1)
+            real_code = torch.cat((real_velocity.detach(), latent_sample.detach()), dim=-1)
             observation = torch.cat((real_code, now_obs), dim=-1)
         
         # 4. Actor输出动作
@@ -657,8 +530,6 @@ class ActorCriticElevationNetMode10(nn.Module):
         
         # 5. 记录额外信息用于监控
         self.extra_info["est_vel"] = vel_mean
-        self.extra_info["adaboot_p"] = self.adaboot_manager.probability
-        self.extra_info["use_estimate"] = 1.0 if use_estimate else 0.0
         
         if self.actor_obs_normalization:
             self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \

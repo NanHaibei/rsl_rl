@@ -213,11 +213,6 @@ class OnPolicyRunner:
 
                 # Compute returns
                 self.alg.compute_returns(obs)
-                
-                # AdaBoot: 如果policy支持，计算并更新bootstrap概率
-                if hasattr(self.alg.policy, 'compute_adaboot_probability'):
-                    self.alg.policy.compute_adaboot_probability()
-                    self.alg.policy.reset_adaboot_episodic_rewards()
 
             # Update policy
             loss_dict = self.alg.update()
@@ -315,8 +310,8 @@ class OnPolicyRunner:
                 self.writer.add_scalar("AMP/final_reward", statistics.mean(locs["final_rewbuffer"]), locs["it"])
             
             # AdaBoot统计记录 - 直接从 policy 获取
-            if hasattr(self.alg.policy, 'get_adaboot_stats'):
-                adaboot_stats = self.alg.policy.get_adaboot_stats()
+            if hasattr(self.alg.policy, 'adaboot_manager') and self.alg.policy.adaboot_manager is not None:
+                adaboot_stats = self.alg.policy.adaboot_manager.get_stats()
                 for key, value in adaboot_stats.items():
                     self.writer.add_scalar(key, value, locs["it"])
             

@@ -157,10 +157,7 @@ class AdaBootManager:
             包含统计信息的字典
         """
         
-        stats = {
-            "adaboot/probability": self.probability,
-            "adaboot/iteration": float(self.current_iteration),
-        }
+        stats = {"adaboot/probability": self.probability}
         
         # 根据不同模式添加特定的统计信息
         if self.type == "CV":
@@ -179,17 +176,6 @@ class AdaBootManager:
                 "adaboot/std_reward": std_r,
                 "adaboot/num_completed_episodes": float(len(self.completed_episodes_rewards))
             })
-        elif self.type == "terrain":
-            stats.update({
-                "adaboot/terrain_level": self.now_terrain_level,
-                "adaboot/max_terrain_level": self.max_terrain_level
-            })
-        elif self.type == "xyVel":
-            stats.update({
-                "adaboot/tracking_reward": self.now_tracking_reward,
-                "adaboot/max_tracking_reward": self.max_tracking_reward
-            })
-        
         return stats
 
 class R2Plus1DElevationEncoder(nn.Module):

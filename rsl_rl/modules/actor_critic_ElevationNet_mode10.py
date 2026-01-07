@@ -318,6 +318,7 @@ class ActorCriticElevationNetMode10(nn.Module):
         obs_groups: dict[str, list[str]],
         num_actions: int,
         env_cfg=None,
+        alg_cfg: dict | None = None,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 128],
@@ -341,6 +342,10 @@ class ActorCriticElevationNetMode10(nn.Module):
         num_latent: int = 19,
         num_decode: int = 70,
         VAE_beta: float = 1.0,
+        use_beta_annealing: bool = True,
+        beta_start: float = 0.01,
+        beta_end: float = 0.5,
+        beta_anneal_steps: int = 10000,
         adaboot_cfg: dict | None = None,
         **kwargs: dict[str, Any],
     ) -> None:
@@ -353,7 +358,43 @@ class ActorCriticElevationNetMode10(nn.Module):
         self.noise_std_type = noise_std_type
         self.history_frames = history_frames
         self.vision_feature_dim = vision_feature_dim
-        self.beta = VAE_beta
+        
+        # Beta配置：根据标志位决定使用退火还是固定值
+        self.use_beta_annealing = use_beta_annealing
+        if self.use_beta_annealing:
+            # 从alg_cfg中获取训练配置（如果有的话）
+            if alg_cfg is not None:
+                self.num_learning_epochs = alg_cfg.get('num_learning_epochs', 5)
+                self.num_mini_batches = alg_cfg.get('num_mini_batches', 4)
+            else:
+                # 使用默认值
+                self.num_learning_epochs = 5
+                self.num_mini_batches = 4
+            
+            self.updates_per_iteration = self.num_learning_epochs * self.num_mini_batches
+            
+            # 使用退火策略
+            self.beta_start = beta_start
+            self.beta_end = beta_end
+            self.beta_anneal_steps = beta_anneal_steps
+            self.beta = self.beta_start  # 初始化为起始值
+            self.current_step = 0
+            self.update_call_count = 0  # 记录update_beta_schedule被调用的次数
+            print(f"[Beta Annealing] 已启用 - 起始值: {self.beta_start}, 目标值: {self.beta_end}, 退火步数: {self.beta_anneal_steps}")
+            print(f"[Beta Annealing] 训练配置 - epochs: {self.num_learning_epochs}, mini_batches: {self.num_mini_batches}, 每iteration更新次数: {self.updates_per_iteration}")
+        else:
+            # 使用固定值
+            self.beta = VAE_beta
+            self.beta_start = VAE_beta
+            self.beta_end = VAE_beta
+            self.beta_anneal_steps = 0
+            self.current_step = 0
+            self.update_call_count = 0
+            self.num_learning_epochs = 5
+            self.num_mini_batches = 4
+            self.updates_per_iteration = 20
+            print(f"[Beta Fixed] 使用固定beta值: {self.beta}")
+        
         self.num_decode = num_decode
         self.num_encoder_output = num_encoder_output
         
@@ -445,6 +486,39 @@ class ActorCriticElevationNetMode10(nn.Module):
 
     def forward(self) -> NoReturn:
         raise NotImplementedError
+    
+    def update_beta_schedule(self) -> None:
+        """更新beta值的退火调度
+        
+        此方法会在每个mini batch的encoder update时被调用，但内部会计数，
+        只有当调用次数达到 num_learning_epochs * num_mini_batches 时才真正更新beta值。
+        
+        单周期退火：从beta_start线性增长到beta_end，然后保持不变
+        - 0 ~ beta_anneal_steps: 线性增长
+        - > beta_anneal_steps: 保持在beta_end
+        
+        如果use_beta_annealing=False，则beta保持固定值不变
+        """
+        if not self.use_beta_annealing:
+            return
+        
+        # 增加调用计数
+        self.update_call_count += 1
+        
+        # 只有当调用次数达到一个完整iteration时才更新beta
+        if self.update_call_count % self.updates_per_iteration != 0:
+            return
+        
+        # 真正的更新逻辑
+        self.current_step += 1
+        
+        if self.current_step <= self.beta_anneal_steps:
+            # 线性退火阶段
+            progress = self.current_step / self.beta_anneal_steps
+            self.beta = self.beta_start + (self.beta_end - self.beta_start) * progress
+        else:
+            # 保持最终值
+            self.beta = self.beta_end
 
     @property
     def action_mean(self) -> torch.Tensor:
@@ -651,6 +725,9 @@ class ActorCriticElevationNetMode10(nn.Module):
         Returns:
             损失字典，包含各项损失值
         """
+        # 更新beta值（单周期退火）
+        self.update_beta_schedule()
+        
         # 获取并归一化policy观测
         policy_obs = self.get_actor_obs(obs_batch)
         policy_obs = self.actor_obs_normalizer(policy_obs)
@@ -696,6 +773,8 @@ class ActorCriticElevationNetMode10(nn.Module):
             "obs_loss": obs_MSE.item(),
             "dkl_loss": dkl_loss.item(),
             "total_loss": autoenc_loss.item(),
+            "beta": self.beta,
+            "beta_step": self.current_step,
         }
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:

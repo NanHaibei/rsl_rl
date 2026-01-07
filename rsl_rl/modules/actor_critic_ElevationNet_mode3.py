@@ -48,6 +48,7 @@ class ActorCriticElevationNetMode3(nn.Module):
         obs_groups: dict[str, list[str]],
         num_actions: int,
         env_cfg=None,
+        alg_cfg: dict | None = None,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [128, 64],

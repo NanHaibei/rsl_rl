@@ -526,7 +526,7 @@ class OnPolicyRunner:
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         actor_critic: ActorCriticType = actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, env_cfg=self.env.cfg, **self.policy_cfg
+            obs, self.cfg["obs_groups"], self.env.num_actions, env_cfg=self.env.cfg, alg_cfg=self.alg_cfg, **self.policy_cfg
         ).to(self.device)
 
         # 如果使用了AMP

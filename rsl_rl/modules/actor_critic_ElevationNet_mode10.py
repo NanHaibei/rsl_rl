@@ -339,7 +339,8 @@ class ActorCriticElevationNetMode10(nn.Module):
         encoder_hidden_dims: tuple[int] | list[int] = [1024, 512, 256],
         decoder_hidden_dims: tuple[int] | list[int] = [256, 512, 1024],
         num_encoder_output:int = 32,
-        num_latent: int = 19,
+        num_latent: int = 14,
+        num_elevation_latent: int = 16,
         num_decode: int = 70,
         VAE_beta: float = 1.0,
         use_beta_annealing: bool = True,
@@ -395,8 +396,13 @@ class ActorCriticElevationNetMode10(nn.Module):
             self.updates_per_iteration = 20
             print(f"[Beta Fixed] 使用固定beta值: {self.beta}")
         
+        # 通过 vision_spatial_size 计算高程图重建维度
+        self.num_elevation_decode = vision_spatial_size[0] * vision_spatial_size[1]
         self.num_decode = num_decode
         self.num_encoder_output = num_encoder_output
+        self.num_latent = num_latent
+        self.num_elevation_latent = num_elevation_latent
+        self.total_latent_dim = 3 + 2 + num_latent + num_elevation_latent  # 速度(3) + 脚掌高度(2) + 纯隐变量 + 高程图隐变量
         
         # 计算观测维度
         num_actor_obs = sum(obs[g].shape[-1] for g in obs_groups["policy"])
@@ -405,7 +411,7 @@ class ActorCriticElevationNetMode10(nn.Module):
         
         ########################################## 网络架构 ##############################################
         # 1. Actor网络
-        self.actor = MLP(self.num_proprio_one_frame + num_latent, num_actions, actor_hidden_dims, activation)
+        self.actor = MLP(self.num_proprio_one_frame + self.total_latent_dim, num_actions, actor_hidden_dims, activation)
         
         # 2. Critic网络
         self.elevation_encoder_critic = R2Plus1DElevationEncoder(
@@ -429,14 +435,24 @@ class ActorCriticElevationNetMode10(nn.Module):
         )
         self.proprio_feature = MLP(num_actor_obs, proprio_feature_dim, proprio_encoder_hidden_dims, activation)
         
-        # 4. encoder-VAE
+        # 4. encoder-VAE：输出4个部分
         self.encoder = MLP(proprio_feature_dim + vision_feature_dim, num_encoder_output, encoder_hidden_dims, activation)
-        self.encoder_latent_mean = nn.Linear(num_encoder_output, num_latent - 3)
-        self.encoder_latent_logvar = nn.Linear(num_encoder_output, num_latent - 3)
-        self.encoder_vel_mean = nn.Linear(num_encoder_output, 3)
-        self.encoder_vel_logvar = nn.Linear(num_encoder_output, 3)
+        # 速度编码器 (3维) - 直接输出，无需重参数化
+        self.encoder_vel = nn.Linear(num_encoder_output, 3)
+        # 脚掌高度编码器 (2维) - 直接输出，无需重参数化
+        self.encoder_feet_height = nn.Linear(num_encoder_output, 2)
+        # 纯隐变量编码器
+        self.encoder_latent_mean = nn.Linear(num_encoder_output, num_latent)
+        self.encoder_latent_logvar = nn.Linear(num_encoder_output, num_latent)
+        # 高程图隐变量编码器
+        self.encoder_elevation_latent_mean = nn.Linear(num_encoder_output, num_elevation_latent)
+        self.encoder_elevation_latent_logvar = nn.Linear(num_encoder_output, num_elevation_latent)
 
-        self.decoder = MLP(num_latent, num_decode, decoder_hidden_dims, activation)
+        # 5. 主decoder：重建观测 (使用所有隐变量)
+        self.decoder = MLP(self.total_latent_dim, num_decode, decoder_hidden_dims, activation)
+        
+        # 6. 高程图decoder：重建无噪声高程图 (只使用高程图隐变量)
+        self.elevation_decoder = MLP(num_elevation_latent, self.num_elevation_decode, decoder_hidden_dims, activation)
 
         # Actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -540,36 +556,59 @@ class ActorCriticElevationNetMode10(nn.Module):
         return code
     
     def encoder_forward(self, proprio_obs: torch.Tensor, height_maps_obs: TensorDict):
-        """编码器前向传播"""
+        """编码器前向传播
+        
+        Returns:
+            code: 完整隐向量 [速度(3) + 脚掌高度(2) + 纯隐变量 + 高程图隐变量]
+            vel_output: 速度直接输出值
+            feet_height_output: 脚掌高度直接输出值
+            latent_sample: 纯隐变量采样值
+            elevation_latent_sample: 高程图隐变量采样值
+            obs_decode: 主decoder重建的观测
+            elevation_decode: 高程图decoder重建的无噪声高程图
+            latent_mean, latent_logvar: 纯隐变量的均值和方差
+            elevation_latent_mean, elevation_latent_logvar: 高程图隐变量的均值和方差
+        """
         # 1. 提取特征
         proprio_features = self.proprio_feature(proprio_obs)
         vision_features = self.elevation_feature(height_maps_obs)
         
-        # 3. 融合特征并通过encoder MLP
+        # 2. 融合特征并通过encoder MLP
         fused_features = torch.cat([proprio_features, vision_features], dim=-1)
         x = self.encoder(fused_features)
         
-        # 4. VAE编码: 输出均值和方差
+        # 3. VAE编码: 输出4个部分
+        # 速度 (3维) - 直接输出
+        vel_output = self.encoder_vel(x)
+        # 脚掌高度 (2维) - 直接输出
+        feet_height_output = self.encoder_feet_height(x)
+        # 纯隐变量
         latent_mean = self.encoder_latent_mean(x)
         latent_logvar = self.encoder_latent_logvar(x)
-        vel_mean = self.encoder_vel_mean(x)
-        vel_logvar = self.encoder_vel_logvar(x)
+        # 高程图隐变量
+        elevation_latent_mean = self.encoder_elevation_latent_mean(x)
+        elevation_latent_logvar = self.encoder_elevation_latent_logvar(x)
         
         # 限制方差范围
         latent_logvar = torch.clip(latent_logvar, min=-10, max=10)
-        vel_logvar = torch.clip(vel_logvar, min=-10, max=10)
+        elevation_latent_logvar = torch.clip(elevation_latent_logvar, min=-10, max=10)
         
-        # 5. 采样隐向量
+        # 4. 采样隐向量（只对纯隐变量和高程图隐变量）
         latent_sample = self.reparameterise(latent_mean, latent_logvar)
-        vel_sample = self.reparameterise(vel_mean, vel_logvar)
+        elevation_latent_sample = self.reparameterise(elevation_latent_mean, elevation_latent_logvar)
         
-        # 6. 拼接成完整隐向量
-        code = torch.cat((vel_sample, latent_sample), dim=-1)
+        # 5. 拼接成完整隐向量
+        code = torch.cat((vel_output, feet_height_output, latent_sample, elevation_latent_sample), dim=-1)
         
-        # 7. 解码
-        decode = self.decoder(code)
+        # 6. 主decoder：重建观测 (使用所有隐变量)
+        obs_decode = self.decoder(code)
         
-        return code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar
+        # 7. 高程图decoder：重建无噪声高程图 (只使用高程图隐变量)
+        elevation_decode = self.elevation_decoder(elevation_latent_sample)
+        
+        return (code, vel_output, feet_height_output, latent_sample, elevation_latent_sample,
+                obs_decode, elevation_decode,
+                latent_mean, latent_logvar, elevation_latent_mean, elevation_latent_logvar)
 
     def _update_distribution(self, mean: torch.Tensor) -> None:
         """更新动作分布"""
@@ -594,7 +633,9 @@ class ActorCriticElevationNetMode10(nn.Module):
         height_maps_obs = obs["height_scan_policy"]
         
         # 2. 编码器前向传播得到隐向量
-        code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar = \
+        (code, vel_output, feet_height_output, latent_sample, elevation_latent_sample,
+         obs_decode, elevation_decode,
+         latent_mean, latent_logvar, elevation_latent_mean, elevation_latent_logvar) = \
             self.encoder_forward(proprio_obs_normalized, height_maps_obs)
         
         # 3. AdaBoot逻辑：根据管理器决定使用估计值还是真实值
@@ -607,12 +648,14 @@ class ActorCriticElevationNetMode10(nn.Module):
             # 使用estimator的估计值（训练estimator）
             observation = torch.cat((code.detach(), now_obs), dim=-1)
         else:
-            # 使用真实速度值（从critic_obs获取）
+            # 使用真实值（从critic_obs获取）
             critic_obs = self.get_critic_obs(obs)
             critic_obs_normalized = self.critic_obs_normalizer(critic_obs)
-            real_velocity = critic_obs_normalized[:, 0:3]  # 提取真实速度
-            # 拼接真实速度、latent均值和当前观测
-            real_code = torch.cat((real_velocity.detach(), latent_sample.detach()), dim=-1)
+            real_velocity = critic_obs_normalized[:, 70:73]  # 提取真实速度
+            real_feet_height = critic_obs_normalized[:, 73:75]  # 提取真实脚掌高度
+            # 拼接真实值、隐变量采样值和当前观测
+            real_code = torch.cat((real_velocity.detach(), real_feet_height.detach(), 
+                                   latent_sample.detach(), elevation_latent_sample.detach()), dim=-1)
             observation = torch.cat((real_code, now_obs), dim=-1)
         
         # 4. Actor输出动作
@@ -620,13 +663,17 @@ class ActorCriticElevationNetMode10(nn.Module):
         self._update_distribution(mean)
         
         # 5. 记录额外信息用于监控
-        self.extra_info["est_vel"] = vel_mean
+        self.extra_info["est_vel"] = vel_output
+        self.extra_info["est_feet_height"] = feet_height_output
         
         if self.actor_obs_normalization:
-            self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
+            self.extra_info["obs_predict"] = obs_decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
                                                        self.actor_obs_normalizer.mean[:self.num_decode]
+            # 高程图重建不需要反归一化，因为高程图有自己的归一化
+            self.extra_info["elevation_predict"] = elevation_decode
         else:
-            self.extra_info["obs_predict"] = decode
+            self.extra_info["obs_predict"] = obs_decode
+            self.extra_info["elevation_predict"] = elevation_decode
         
         return self.distribution.sample(), self.extra_info
 
@@ -638,23 +685,29 @@ class ActorCriticElevationNetMode10(nn.Module):
         height_maps_obs = obs["height_scan_policy"]
         
         # 2. 编码器前向传播得到隐向量
-        code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar = \
+        (code, vel_output, feet_height_output, latent_sample, elevation_latent_sample,
+         obs_decode, elevation_decode,
+         latent_mean, latent_logvar, elevation_latent_mean, elevation_latent_logvar) = \
             self.encoder_forward(proprio_obs, height_maps_obs)
         
         # 3. 推理时使用均值而非采样值
         now_obs = proprio_obs[:, 0:self.num_proprio_one_frame]  # 取当前观测值部分
-        observation = torch.cat((vel_mean.detach(), latent_mean.detach(), now_obs), dim=-1)
+        observation = torch.cat((vel_output.detach(), feet_height_output.detach(), 
+                                latent_mean.detach(), elevation_latent_mean.detach(), now_obs), dim=-1)
         
         # 4. Actor输出确定性动作
         mean = self.actor(observation)
         
         # 5. 记录额外信息
-        self.extra_info["est_vel"] = vel_mean
+        self.extra_info["est_vel"] = vel_output
+        self.extra_info["est_feet_height"] = feet_height_output
         if self.actor_obs_normalization:
-            self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
+            self.extra_info["obs_predict"] = obs_decode * (self.actor_obs_normalizer.std[:self.num_decode] + 1e-2) + \
                                             self.actor_obs_normalizer.mean[:self.num_decode]
+            self.extra_info["elevation_predict"] = elevation_decode
         else:
-            self.extra_info["obs_predict"] = decode
+            self.extra_info["obs_predict"] = obs_decode
+            self.extra_info["elevation_predict"] = elevation_decode
         
         return mean, self.extra_info
 
@@ -734,28 +787,49 @@ class ActorCriticElevationNetMode10(nn.Module):
         height_maps_obs = obs_batch["height_scan_policy"]
 
         # 前向传播得到编码器输出
-        code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar = \
+        (code, vel_output, feet_height_output, latent_sample, elevation_latent_sample,
+         obs_decode, elevation_decode,
+         latent_mean, latent_logvar, elevation_latent_mean, elevation_latent_logvar) = \
             self.encoder_forward(policy_obs, height_maps_obs)
 
-        # 获取并归一化critic观测，提取真实速度
+        # 获取并归一化critic观测，提取真实速度和脚掌高度
+        # Critic观测顺序: base_ang_vel[3] + projected_gravity[3] + torso_ang_vel[3] + torso_projected_gravity[3]
+        #                + joint_pos[29] + joint_vel[29] + base_lin_vel[3] + left_foot_height[1] + right_foot_height[1]
+        #                + velocity_commands[3] + actions[29]
         critic_obs = self.get_critic_obs(obs_batch)
         critic_obs = self.critic_obs_normalizer(critic_obs)
-        vel_target = critic_obs[:, 0:3]  # 真实速度作为目标
+        vel_target = critic_obs[:, 70:73]  # base_lin_vel 在第70-72位置
+        feet_height_target = critic_obs[:, 73:75]  # left_foot_height[73] + right_foot_height[74]
 
         # 获取下一时刻观测，提取目标观测
-        next_observations = self.get_actor_obs(next_observations_batch)
-        next_observations = self.actor_obs_normalizer(next_observations)
+        next_observations = self.get_critic_obs(next_observations_batch)
+        next_observations = self.critic_obs_normalizer(next_observations)
         obs_target = next_observations[:, 0:self.num_decode]  # 取最新观测
+        
+        # 获取无噪声高程图作为目标（从height_scan_critic获取，因为它没有噪声）
+        elevation_target = obs_batch["height_scan_critic"][:, 0, :, :].flatten(1)  # 取当前帧并展平
 
         vel_target.requires_grad = False
+        feet_height_target.requires_grad = False
         obs_target.requires_grad = False
+        elevation_target.requires_grad = False
 
-        # 损失计算：速度重建损失 + obs重建损失 + KL散度损失
-        vel_MSE = nn.MSELoss()(vel_sample, vel_target)
-        # 确保decode和obs_target维度匹配
-        obs_MSE = nn.MSELoss()(decode, obs_target)
-        dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
-        autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
+        # 损失计算：
+        # 1. 速度重建损失（直接输出，无需采样）
+        vel_MSE = nn.MSELoss()(vel_output, vel_target)
+        # 2. 脚掌高度重建损失（直接输出，无需采样）
+        feet_height_MSE = nn.MSELoss()(feet_height_output, feet_height_target)
+        # 3. 观测重建损失
+        obs_MSE = nn.MSELoss()(obs_decode, obs_target)
+        # 4. 高程图重建损失
+        elevation_MSE = nn.MSELoss()(elevation_decode, elevation_target)
+        # 5. KL散度损失（只对纯隐变量和高程图隐变量计算，不对线速度和足端高度计算）
+        dkl_latent = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
+        dkl_elevation = -0.5 * torch.mean(torch.sum(1 + elevation_latent_logvar - elevation_latent_mean.pow(2) - elevation_latent_logvar.exp(), dim=1))
+        dkl_loss = dkl_latent + dkl_elevation
+        
+        # 总损失
+        autoenc_loss = vel_MSE + feet_height_MSE + obs_MSE + elevation_MSE + self.beta * dkl_loss
 
         # 反向传播
         encoder_optimizer.zero_grad()
@@ -770,7 +844,11 @@ class ActorCriticElevationNetMode10(nn.Module):
 
         return {
             "vel_loss": vel_MSE.item(),
+            "feet_height_loss": feet_height_MSE.item(),
             "obs_loss": obs_MSE.item(),
+            "elevation_loss": elevation_MSE.item(),
+            "dkl_latent": dkl_latent.item(),
+            "dkl_elevation": dkl_elevation.item(),
             "dkl_loss": dkl_loss.item(),
             "total_loss": autoenc_loss.item(),
             "beta": self.beta,
@@ -803,11 +881,14 @@ class ActorCriticElevationNetMode10(nn.Module):
             {'params': self.proprio_feature.parameters()},
             {'params': self.elevation_feature.parameters()},
             {'params': self.encoder.parameters()},
+            {'params': self.encoder_vel.parameters()},
+            {'params': self.encoder_feet_height.parameters()},
             {'params': self.encoder_latent_mean.parameters()},
             {'params': self.encoder_latent_logvar.parameters()},
-            {'params': self.encoder_vel_mean.parameters()},
-            {'params': self.encoder_vel_logvar.parameters()},
+            {'params': self.encoder_elevation_latent_mean.parameters()},
+            {'params': self.encoder_elevation_latent_logvar.parameters()},
             {'params': self.decoder.parameters()},
+            {'params': self.elevation_decoder.parameters()},
         ], lr=learning_rate)
         
         return {
@@ -848,14 +929,14 @@ class _ElevationNetMode10OnnxPolicyExporter(torch.nn.Module):
             self.elevation_feature = copy.deepcopy(policy.elevation_feature)
         if hasattr(policy, "encoder"):
             self.encoder = copy.deepcopy(policy.encoder)
+        if hasattr(policy, "encoder_vel"):
+            self.encoder_vel = copy.deepcopy(policy.encoder_vel)
+        if hasattr(policy, "encoder_feet_height"):
+            self.encoder_feet_height = copy.deepcopy(policy.encoder_feet_height)
         if hasattr(policy, "encoder_latent_mean"):
             self.encoder_latent_mean = copy.deepcopy(policy.encoder_latent_mean)
-        if hasattr(policy, "encoder_latent_logvar"):
-            self.encoder_latent_logvar = copy.deepcopy(policy.encoder_latent_logvar)
-        if hasattr(policy, "encoder_vel_mean"):
-            self.encoder_vel_mean = copy.deepcopy(policy.encoder_vel_mean)
-        if hasattr(policy, "encoder_vel_logvar"):
-            self.encoder_vel_logvar = copy.deepcopy(policy.encoder_vel_logvar)
+        if hasattr(policy, "encoder_elevation_latent_mean"):
+            self.encoder_elevation_latent_mean = copy.deepcopy(policy.encoder_elevation_latent_mean)
         if hasattr(policy, "actor"):
             self.actor = copy.deepcopy(policy.actor)
         
@@ -894,11 +975,13 @@ class _ElevationNetMode10OnnxPolicyExporter(torch.nn.Module):
         x = self.encoder(fused_features)
         
         # VAE编码：使用均值（推理模式）
+        vel_output = self.encoder_vel(x)
+        feet_height_output = self.encoder_feet_height(x)
         latent_mean = self.encoder_latent_mean(x)
-        vel_mean = self.encoder_vel_mean(x)
+        elevation_latent_mean = self.encoder_elevation_latent_mean(x)
         
         # 拼接隐向量
-        code = torch.cat((vel_mean, latent_mean), dim=-1)
+        code = torch.cat((vel_output, feet_height_output, latent_mean, elevation_latent_mean), dim=-1)
         
         # 与当前本体观测拼接
         now_obs = normalized_obs[:, 0:self.num_proprio_one_frame]
@@ -906,7 +989,7 @@ class _ElevationNetMode10OnnxPolicyExporter(torch.nn.Module):
         
         # 输出动作
         actions_mean = self.actor(observation)
-        return actions_mean, vel_mean
+        return actions_mean, vel_output, feet_height_output
 
     def export(self, path, filename):
         self.to("cpu")
@@ -926,6 +1009,6 @@ class _ElevationNetMode10OnnxPolicyExporter(torch.nn.Module):
             opset_version=opset_version,
             verbose=self.verbose,
             input_names=["obs"],
-            output_names=["actions", "est_vel"],
+            output_names=["actions", "est_vel", "est_feet_height"],
             dynamic_axes={},
         )

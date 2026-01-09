@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9, ActorCriticElevationNetMode9A, ActorCriticElevationNetMode10, ActorCriticElevationNetMode11
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9, ActorCriticElevationNetMode9A, ActorCriticElevationNetMode10, ActorCriticElevationNetMode11, ActorCriticElevationNetMode12L
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -22,7 +22,7 @@ from rsl_rl.utils import AMPLoader
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 | ActorCriticElevationNetMode11
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 | ActorCriticElevationNetMode11 | ActorCriticElevationNetMode12L
     """The actor critic module."""
 
     def __init__(

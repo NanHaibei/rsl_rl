@@ -464,7 +464,7 @@ class ActorCriticElevationNetMode11(nn.Module):
         
         # 5. Actor输出动作：当前帧本体观测 + 高程图特征 + VAE输出
         current_proprio_obs = proprio_obs_normalized[:, 0:self.num_proprio_one_frame]
-        actor_input = torch.cat((vision_features, current_proprio_obs, vel_output.detach(), feet_height_output.detach(), latent_sample.detach()), dim=-1)
+        actor_input = torch.cat((vision_features, current_proprio_obs, vel_output.detach(), feet_height_output.detach(), latent_mean.detach()), dim=-1)
         mean = self.actor(actor_input)
         self._update_distribution(mean)
         

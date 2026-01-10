@@ -11,7 +11,7 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9, ActorCriticElevationNetMode9A, ActorCriticElevationNetMode10, ActorCriticElevationNetMode11, ActorCriticElevationNetMode12L
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode2A, ActorCriticElevationNetMode3, ActorCriticElevationNetMode4, ActorCriticElevationNetMode5, ActorCriticElevationNetMode6, ActorCriticElevationNetMode7, ActorCriticElevationNetMode8, ActorCriticElevationNetMode9, ActorCriticElevationNetMode9A, ActorCriticElevationNetMode10, ActorCriticElevationNetMode11, ActorCriticElevationNetMode12, ActorCriticElevationNetMode12L, ActorCriticElevationNetMode12P2
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -22,7 +22,7 @@ from rsl_rl.utils import AMPLoader
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 | ActorCriticElevationNetMode11 | ActorCriticElevationNetMode12L
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 | ActorCriticElevationNetMode11 | ActorCriticElevationNetMode12 | ActorCriticElevationNetMode12L | ActorCriticElevationNetMode12P2
     """The actor critic module."""
 
     def __init__(
@@ -102,7 +102,7 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 | ActorCriticElevationNetMode11 = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode3 | ActorCriticElevationNetMode4 | ActorCriticElevationNetMode5 | ActorCriticElevationNetMode6 | ActorCriticElevationNetMode7 | ActorCriticElevationNetMode8 | ActorCriticElevationNetMode9 | ActorCriticElevationNetMode9A | ActorCriticElevationNetMode10 | ActorCriticElevationNetMode11 | ActorCriticElevationNetMode12 | ActorCriticElevationNetMode12P2 = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ或ElevationNetMode2A/3/4/5/6
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
@@ -115,7 +115,8 @@ class PPO:
         self.elevation_net_mode8 = True if type(self.policy) == ActorCriticElevationNetMode8 else False
         self.elevation_net_mode10 = True if type(self.policy) == ActorCriticElevationNetMode10 else False
         self.elevation_net_mode11 = True if type(self.policy) == ActorCriticElevationNetMode11 else False
-
+        self.elevation_net_mode12 = True if type(self.policy) == ActorCriticElevationNetMode12 else False        
+        self.elevation_net_mode12p2 = True if type(self.policy) == ActorCriticElevationNetMode12P2 else False
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)
         self.optimizer = optimizers_dict.get("optimizer")
@@ -390,8 +391,8 @@ class PPO:
                         for param_group in self.encoder_optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
-            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5/6/7/8/10/11)
-            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4 or self.elevation_net_mode5 or self.elevation_net_mode6 or self.elevation_net_mode7 or self.elevation_net_mode8 or self.elevation_net_mode10 or self.elevation_net_mode11:
+            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5/6/7/8/10/11/12)
+            if self.estnet or self.dwaq or self.elevation_net_mode3 or self.elevation_net_mode4 or self.elevation_net_mode5 or self.elevation_net_mode6 or self.elevation_net_mode7 or self.elevation_net_mode8 or self.elevation_net_mode10 or self.elevation_net_mode11 or self.elevation_net_mode12 or self.elevation_net_mode12p2:
                 encoder_losses = self.policy.update_encoder(
                     obs_batch, 
                     next_observations_batch, 
@@ -630,6 +631,32 @@ class PPO:
                 encoder_params_dict['elevation_encoder_actor'] = self.policy.elevation_encoder_actor.state_dict()
             if hasattr(self.policy, 'elevation_encoder_critic'):
                 encoder_params_dict['elevation_encoder_critic'] = self.policy.elevation_encoder_critic.state_dict()
+            # Mode12特有的encoder参数
+            if hasattr(self.policy, 'vision_head_1'):
+                encoder_params_dict['vision_head_1'] = self.policy.vision_head_1.state_dict()
+            if hasattr(self.policy, 'vision_head_2'):
+                encoder_params_dict['vision_head_2'] = self.policy.vision_head_2.state_dict()
+            if hasattr(self.policy, 'proprio_history_mlp'):
+                encoder_params_dict['proprio_history_mlp'] = self.policy.proprio_history_mlp.state_dict()
+            if hasattr(self.policy, 'encoder'):
+                encoder_params_dict['encoder'] = self.policy.encoder.state_dict()
+            if hasattr(self.policy, 'encoder_vel'):
+                encoder_params_dict['encoder_vel'] = self.policy.encoder_vel.state_dict()
+            if hasattr(self.policy, 'encoder_feet_height'):
+                encoder_params_dict['encoder_feet_height'] = self.policy.encoder_feet_height.state_dict()
+            if hasattr(self.policy, 'encoder_latent'):
+                encoder_params_dict['encoder_latent'] = self.policy.encoder_latent.state_dict()
+            # Mode12P2特有的encoder参数
+            if hasattr(self.policy, 'elevation_encoder'):
+                encoder_params_dict['elevation_encoder'] = self.policy.elevation_encoder.state_dict()
+            if hasattr(self.policy, 'elevation_decoder'):
+                encoder_params_dict['elevation_decoder'] = self.policy.elevation_decoder.state_dict()
+            if hasattr(self.policy, 'proprio_encoder'):
+                encoder_params_dict['proprio_encoder'] = self.policy.proprio_encoder.state_dict()
+            if hasattr(self.policy, 'encoder_obs_latent'):
+                encoder_params_dict['encoder_obs_latent'] = self.policy.encoder_obs_latent.state_dict()
+            if hasattr(self.policy, 'obs_decoder'):
+                encoder_params_dict['obs_decoder'] = self.policy.obs_decoder.state_dict()
             
             if encoder_params_dict:
                 model_params.append(encoder_params_dict)

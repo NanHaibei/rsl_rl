@@ -32,7 +32,7 @@ from .actor_critic_ElevationNet_mode10 import ActorCriticElevationNetMode10
 from .actor_critic_ElevationNet_mode11 import ActorCriticElevationNetMode11
 from .actor_critic_ElevationNet_mode12 import ActorCriticElevationNetMode12
 from .actor_critic_ElevationNet_mode12L import ActorCriticElevationNetMode12L
-from .actor_critic_ElevationNet_mode12P2 import ActorCriticElevationNetMode12P2
+from .actor_critic_ElevationNet_mode12 import ActorCriticElevationNetMode12
 
 __all__ = [
     "ActorCritic",
@@ -63,5 +63,5 @@ __all__ = [
     "ActorCriticElevationNetMode11",
     "ActorCriticElevationNetMode12",
     "ActorCriticElevationNetMode12L",
-    "ActorCriticElevationNetMode12P2",
+    "ActorCriticElevationNetMode12",
 ]

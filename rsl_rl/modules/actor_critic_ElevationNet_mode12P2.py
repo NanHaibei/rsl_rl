@@ -415,8 +415,8 @@ class ActorCriticElevationNetMode12P2(nn.Module):
             # 高程图编码 -> z_e
             elevation_features = self.elevation_vae_encoder(sampled_height_maps)
             mu_e = self.elevation_mu(elevation_features)
-            logvar_e = self.elevation_logvar(elevation_features)
-            z_e = self.reparameterize(mu_e, logvar_e)
+            # logvar_e = self.elevation_logvar(elevation_features)
+            # z_e = self.reparameterize(mu_e, logvar_e)
             
             # 本体编码 -> v̂, z_p（使用归一化后的完整5帧历史）
             proprio_features = self.proprio_encoder(proprio_obs_normalized)
@@ -424,7 +424,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
             z_p = self.proprio_latent_head(proprio_features)
         
         # 4. 融合特征
-        fused_features = torch.cat([current_proprio_obs, v_hat, z_e, z_p], dim=-1)
+        fused_features = torch.cat([current_proprio_obs, v_hat, mu_e, z_p], dim=-1)
         
         # 5. Actor输出动作
         mean = self.actor(fused_features)
@@ -450,8 +450,8 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         # 3. 编码器：获取隐变量
         elevation_features = self.elevation_vae_encoder(sampled_height_maps)
         mu_e = self.elevation_mu(elevation_features)
-        logvar_e = self.elevation_logvar(elevation_features)
-        z_e = self.reparameterize(mu_e, logvar_e)
+        # logvar_e = self.elevation_logvar(elevation_features)
+        # z_e = self.reparameterize(mu_e, logvar_e)
         
         # 本体编码（使用归一化后的完整5帧历史）
         proprio_features = self.proprio_encoder(proprio_obs_normalized)
@@ -459,7 +459,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         z_p = self.proprio_latent_head(proprio_features)
         
         # 4. 融合特征
-        fused_features = torch.cat([current_proprio_obs, v_hat, z_e, z_p], dim=-1)
+        fused_features = torch.cat([current_proprio_obs, v_hat, mu_e, z_p], dim=-1)
         
         # 5. Actor输出动作
         mean = self.actor(fused_features)
@@ -553,8 +553,8 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         Returns:
             losses: 损失字典
         """
-        # KL散度权重（固定值）
-        kl_weight = 0.001
+        # KL散度权重（可以根据训练调整）
+        kl_weight = 0.0001  # 降低KL权重，从0.001改为0.0001
         
         # 1. 编码
         # 1.1 高程图VAE编码
@@ -565,6 +565,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         
         mu_e = self.elevation_mu(elevation_features)
         logvar_e = self.elevation_logvar(elevation_features)
+        logvar_e = torch.clamp(logvar_e, min=-10.0, max=10.0)  # 防止数值不稳定
         z_e = self.reparameterize(mu_e, logvar_e)
         
         # 1.2 本体历史编码（使用归一化后的policy观测）
@@ -606,8 +607,10 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         obs_target = critic_obs_next_normalized[:, :self.num_decode]
         obs_recon_loss = F.mse_loss(obs_recon, obs_target)
         
-        # 3.3 KL散度（VAE的正则化项）
-        kl_loss = -0.5 * torch.sum(1 + logvar_e - mu_e.pow(2) - logvar_e.exp(), dim=-1).mean()
+        # 3.3 KL散度（VAE的正则化项）- 使用per-dimension平均而不是sum
+        # 这样KL损失的scale与latent_dim无关
+        # kl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_e - mu_e.pow(2) - logvar_e.exp(), dim=1))
+        kl_loss = -0.5 * torch.mean(1 + logvar_e - mu_e.pow(2) - logvar_e.exp())
         
         # 3.4 速度估计损失
         vel_target = critic_obs_next_normalized[:, 70:73]  # 假设速度在这个位置

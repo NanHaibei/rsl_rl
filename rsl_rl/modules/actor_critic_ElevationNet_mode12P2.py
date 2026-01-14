@@ -692,67 +692,183 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         """设置评估模式"""
         return self.train(False)
 
-
-class ActorCriticElevationNetMode12P2Inference(nn.Module):
-    """推理时使用的网络（只包含Actor和编码器）"""
-    
-    def __init__(self, policy: ActorCriticElevationNetMode12P2):
-        super().__init__()
-        self.policy = policy
-        self.num_actor_obs = policy.num_actor_obs
-        self.elevation_sampled_frames = policy.elevation_sampled_frames
-        self.vision_spatial_size = policy.vision_spatial_size
-    
-    def forward(self, proprio_obs_history: torch.Tensor, elevation_obs: torch.Tensor, current_frame_obs: torch.Tensor) -> torch.Tensor:
-        """推理前向传播
+    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode12P2_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将ElevationNet Mode12P2策略导出为ONNX格式
         
         Args:
-            proprio_obs_history: 本体历史观测 [B, T*obs_dim]
-            elevation_obs: 高程图历史 [B, T*H*W]
-            current_frame_obs: 当前帧本体观测 [B, obs_dim]
-            
-        Returns:
-            actions: 动作 [B, num_actions]
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"ElevationNet_mode12P2_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
         """
-        # 归一化当前帧观测
-        current_obs_normalized = self.policy.actor_obs_normalizer(current_frame_obs)
+        import copy
+        import os
         
-        # 高程图编码
-        elevation_features = self.policy.elevation_vae_encoder(elevation_obs)
-        mu_e = self.policy.elevation_mu(elevation_features)
-        logvar_e = self.policy.elevation_logvar(elevation_features)
-        z_e = self.policy.reparameterize(mu_e, logvar_e)
-        
-        # 本体历史编码
-        proprio_features = self.policy.proprio_encoder(proprio_obs_history)
-        v_hat = self.policy.proprio_vel_head(proprio_features)
-        z_p = self.policy.proprio_latent_head(proprio_features)
-        
-        # Actor前向：[当前帧观测 + v̂ + z_e + z_p] -> 动作
-        actor_input = torch.cat([current_obs_normalized, v_hat, z_e, z_p], dim=-1)
-        actions = self.policy.actor(actor_input)
-        
-        return actions
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建ElevationNet Mode12P2专用的导出器
+        exporter = _ElevationNetMode12P2OnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _ElevationNetMode12P2OnnxPolicyExporter(torch.nn.Module):
+    """ElevationNet Mode12P2策略的ONNX导出器
     
-    def export(self, path: str, verbose: bool = False):
-        """导出为ONNX"""
+    Mode12P2的推理流程:
+    1. 从完整输入中分离：单帧本体观测 + 完整5帧本体历史 + 高程图历史
+    2. 高程图编码：高程图 -> elevation_vae_encoder -> elevation_mu -> z_e
+    3. 本体编码：5帧历史 -> proprio_encoder -> v_hat, z_p
+    4. Actor推理：[单帧本体 + v_hat + z_e + z_p] -> actor -> actions
+    """
+
+    def __init__(self, policy: ActorCriticElevationNetMode12P2, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        
+        # 复制策略所需的模块
+        # 高程图VAE编码器和mu head
+        if hasattr(policy, "elevation_vae_encoder"):
+            self.elevation_vae_encoder = copy.deepcopy(policy.elevation_vae_encoder)
+        if hasattr(policy, "elevation_mu"):
+            self.elevation_mu = copy.deepcopy(policy.elevation_mu)
+        
+        # 本体编码器和相关head
+        if hasattr(policy, "proprio_encoder"):
+            self.proprio_encoder = copy.deepcopy(policy.proprio_encoder)
+        if hasattr(policy, "proprio_vel_head"):
+            self.proprio_vel_head = copy.deepcopy(policy.proprio_vel_head)
+        if hasattr(policy, "proprio_latent_head"):
+            self.proprio_latent_head = copy.deepcopy(policy.proprio_latent_head)
+        
+        # Actor网络
+        if hasattr(policy, "actor"):
+            self.actor = copy.deepcopy(policy.actor)
+        
+        # 保存维度信息
+        self.elevation_sampled_frames = policy.elevation_sampled_frames
+        self.vision_spatial_size = policy.vision_spatial_size
+        self.num_proprio_one_frame = policy.num_proprio_one_frame
+        self.num_actor_obs = policy.num_actor_obs  # 5帧历史维度
+        self.latent_dim = policy.latent_dim
+        self.vel_dim = policy.vel_dim
+        self.proprio_latent_dim = policy.proprio_latent_dim
+        
+        # 计算各部分维度
+        height, width = self.vision_spatial_size
+        self.elevation_dim = self.elevation_sampled_frames * height * width
+
+        # 复制归一化器
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+
+    def forward(self, obs_input):
+        """前向传播（单输入版本）
+        
+        Args:
+            obs_input: 合并的观测数据，形状为 [batch_size, total_obs_dim]
+                       组成：[完整5帧历史 | 高程图]
+                       - 完整5帧历史：num_actor_obs 维（例如G1中480维）
+                       - 高程图：elevation_dim 维（例如5×25×17=2125维）
+        
+        Returns:
+            actions_mean: 动作均值，形状为 [batch_size, num_actions]
+        """
+        batch_size = obs_input.shape[0]
+        
+        # 切片分离各部分数据
+        offset = 0
+        # 1. 完整5帧历史（用于本体编码器和actor）
+        proprio_history = obs_input[:, offset:offset + self.num_actor_obs]
+        offset += self.num_actor_obs
+        
+        # 2. 高程图数据
+        elevation_data_flat = obs_input[:, offset:]
+        
+        # 将高程图数据reshape为 [B, sampled_frames, height, width]
+        height, width = self.vision_spatial_size
+        elevation_data = elevation_data_flat.reshape(
+            batch_size, self.elevation_sampled_frames, height, width
+        )
+        
+        # 应用归一化器到完整5帧历史，然后提取单帧
+        proprio_history_normalized = self.normalizer(proprio_history)
+        current_proprio_obs = proprio_history_normalized[:, 0:self.num_proprio_one_frame]
+        
+        # 高程图编码：elevation -> z_e
+        elevation_features = self.elevation_vae_encoder(elevation_data)
+        z_e = self.elevation_mu(elevation_features)  # 推理时使用均值
+        
+        # 本体编码：5帧历史（归一化后） -> v_hat, z_p
+        proprio_features = self.proprio_encoder(proprio_history_normalized)
+        v_hat = self.proprio_vel_head(proprio_features)
+        z_p = self.proprio_latent_head(proprio_features)
+        
+        # 融合特征
+        fused_features = torch.cat([current_proprio_obs, v_hat, z_e, z_p], dim=-1)
+        
+        # 输出动作
+        actions_mean = self.actor(fused_features)
+        return actions_mean
+
+    def export(self, path, filename):
+        self.to("cpu")
         self.eval()
+        opset_version = 18
         
-        num_proprio_history = self.num_actor_obs * self.elevation_sampled_frames
-        elevation_total = self.elevation_sampled_frames * self.vision_spatial_size[0] * self.vision_spatial_size[1]
+        # 计算总输入维度（不再包含单独的单帧本体）
+        total_obs_dim = self.num_actor_obs + self.elevation_dim
         
-        dummy_proprio_history = torch.zeros(1, num_proprio_history)
-        dummy_elevation = torch.zeros(1, elevation_total)
-        dummy_current_obs = torch.zeros(1, self.num_actor_obs)
+        # 创建单个合并的输入示例
+        obs_input = torch.zeros(1, total_obs_dim)
+        
+        print(f"\n{'='*80}")
+        print(f"ONNX导出配置 (单输入模式 - Mode12P2):")
+        print(f"{'='*80}")
+        print(f"  5帧历史维度:      {self.num_actor_obs}")
+        print(f"  高程图维度:       {self.elevation_dim} ({self.elevation_sampled_frames}×{self.vision_spatial_size[0]}×{self.vision_spatial_size[1]})")
+        print(f"  总输入维度:       {total_obs_dim}")
+        print(f"  ")
+        print(f"  输入切片方式:")
+        print(f"    [:, 0:{self.num_actor_obs}] = 5帧历史")
+        print(f"    [:, {self.num_actor_obs}:] = 高程图")
+        print(f"  ")
+        print(f"  处理流程:")
+        print(f"    1. 对5帧历史应用归一化 -> 提取单帧 ({self.num_proprio_one_frame}维)")
+        print(f"    2. 高程图编码 -> z_e ({self.latent_dim}维)")
+        print(f"    3. 5帧历史编码 -> v_hat ({self.vel_dim}维) + z_p ({self.proprio_latent_dim}维)")
+        print(f"    4. Actor: [单帧 + v_hat + z_e + z_p] -> actions")
+        print(f"{'='*80}\n")
         
         torch.onnx.export(
             self,
-            (dummy_proprio_history, dummy_elevation, dummy_current_obs),
-            path,
+            obs_input,
+            os.path.join(path, filename),
             export_params=True,
-            opset_version=11,
-            do_constant_folding=True,
-            input_names=['proprio_obs_history', 'elevation_obs', 'current_frame_obs'],
-            output_names=['actions'],
-            verbose=verbose
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
         )
+    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode12P2_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将ElevationNet Mode12P2策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"ElevationNet_mode12P2_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建ElevationNet Mode12P2专用的导出器
+        exporter = _ElevationNetMode12P2OnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+

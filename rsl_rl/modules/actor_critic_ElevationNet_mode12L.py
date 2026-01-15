@@ -127,7 +127,7 @@ class R21DElevationEncoder(nn.Module):
         
         # 归一化
         x_mean = x.mean(dim=(-1, -2, -3), keepdim=True)
-        x = torch.clip((x - x_mean) / 0.6, -5.0, 5.0)
+        x = torch.clip((x - x_mean) / 0.6, -3.0, 3.0)
         
         # 通过R(2+1)D卷积
         x = self.conv(x)

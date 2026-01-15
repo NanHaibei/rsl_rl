@@ -150,7 +150,7 @@ class R21DElevationEncoder(nn.Module):
         
         # 归一化
         x_mean = x.mean(dim=(-1, -2, -3), keepdim=True)
-        x = torch.clip((x - x_mean) / 0.6, -5.0, 5.0)
+        x = torch.clip((x - x_mean) / 0.6, -3.0, 3.0)
         
         # 通过R(2+1)D卷积
         x = self.conv(x)
@@ -202,7 +202,6 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         # 解码器参数（Mode12P2特有）
         decoder_hidden_dims: list[int] = [256, 256],
         num_decode: int = 51,  # 重建的观测维度
-        elevation_decode_size: int = 2125,  # critic中无噪声高程图的大小
         **kwargs: dict[str, Any],
     ) -> None:
         super().__init__()
@@ -221,7 +220,8 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         self.vel_dim = vel_dim
         self.proprio_latent_dim = proprio_latent_dim
         self.num_decode = num_decode
-        self.elevation_decode_size = elevation_decode_size
+        # 自动计算高程图解码大小
+        self.elevation_decode_size = elevation_sampled_frames * vision_spatial_size[0] * vision_spatial_size[1]
         
         # 计算观测维度
         # policy: 包含5帧历史的本体观测（已拼接）
@@ -295,9 +295,12 @@ class ActorCriticElevationNetMode12P2(nn.Module):
             activation=activation_name,
         )
         
-        # 本体编码器的输出head
-        self.proprio_vel_head = nn.Linear(encoder_hidden_dims[-1], vel_dim)  # 速度估计
-        self.proprio_latent_head = nn.Linear(encoder_hidden_dims[-1], proprio_latent_dim)  # 本体隐变量
+        # 本体编码器的输出head（输入包含proprio_features + mu_e）
+        self.proprio_vel_head = nn.Linear(encoder_hidden_dims[-1] + latent_dim, vel_dim)  # 速度估计
+        self.proprio_latent_head = nn.Linear(encoder_hidden_dims[-1] + latent_dim, proprio_latent_dim)  # 本体隐变量
+        
+        # ============ KL权重配置 ============
+        self.kl_weight = kwargs.get('kl_weight', 0.001)  # 从配置读取，默认0.001
         
         # ============ 解码器部分 ============
         
@@ -305,7 +308,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         self.elevation_decoder = MLP(
             input_dim=latent_dim,
             hidden_dims=decoder_hidden_dims,
-            output_dim=elevation_decode_size,
+            output_dim=self.elevation_decode_size,
             activation=activation_name,
         )
         
@@ -415,13 +418,12 @@ class ActorCriticElevationNetMode12P2(nn.Module):
             # 高程图编码 -> z_e
             elevation_features = self.elevation_vae_encoder(sampled_height_maps)
             mu_e = self.elevation_mu(elevation_features)
-            # logvar_e = self.elevation_logvar(elevation_features)
-            # z_e = self.reparameterize(mu_e, logvar_e)
             
-            # 本体编码 -> v̂, z_p（使用归一化后的完整5帧历史）
+            # 本体编码 -> v̂, z_p（使用归一化后的完整5帧历史 + mu_e）
             proprio_features = self.proprio_encoder(proprio_obs_normalized)
-            v_hat = self.proprio_vel_head(proprio_features)
-            z_p = self.proprio_latent_head(proprio_features)
+            proprio_mu_e_features = torch.cat([proprio_features, mu_e], dim=-1)
+            v_hat = self.proprio_vel_head(proprio_mu_e_features)
+            z_p = self.proprio_latent_head(proprio_mu_e_features)
         
         # 4. 融合特征
         fused_features = torch.cat([current_proprio_obs, v_hat, mu_e, z_p], dim=-1)
@@ -450,13 +452,12 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         # 3. 编码器：获取隐变量
         elevation_features = self.elevation_vae_encoder(sampled_height_maps)
         mu_e = self.elevation_mu(elevation_features)
-        # logvar_e = self.elevation_logvar(elevation_features)
-        # z_e = self.reparameterize(mu_e, logvar_e)
         
-        # 本体编码（使用归一化后的完整5帧历史）
+        # 本体编码（使用归一化后的完整5帧历史 + mu_e）
         proprio_features = self.proprio_encoder(proprio_obs_normalized)
-        v_hat = self.proprio_vel_head(proprio_features)
-        z_p = self.proprio_latent_head(proprio_features)
+        proprio_mu_e_features = torch.cat([proprio_features, mu_e], dim=-1)
+        v_hat = self.proprio_vel_head(proprio_mu_e_features)
+        z_p = self.proprio_latent_head(proprio_mu_e_features)
         
         # 4. 融合特征
         fused_features = torch.cat([current_proprio_obs, v_hat, mu_e, z_p], dim=-1)
@@ -553,9 +554,6 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         Returns:
             losses: 损失字典
         """
-        # KL散度权重（可以根据训练调整）
-        kl_weight = 0.0001  # 降低KL权重，从0.001改为0.0001
-        
         # 1. 编码
         # 1.1 高程图VAE编码
         elevation_obs = obs_batch["height_scan_policy"]  # [B, T, H, W] 或 [B, T*H*W]
@@ -568,20 +566,24 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         logvar_e = torch.clamp(logvar_e, min=-10.0, max=10.0)  # 防止数值不稳定
         z_e = self.reparameterize(mu_e, logvar_e)
         
-        # 1.2 本体历史编码（使用归一化后的policy观测）
+        # 1.2 本体历史编码（使用归一化后的policy观测 + mu_e）
         proprio_history = obs_batch["policy"]  # [B, T*obs_dim]（例如G1中480维）
         proprio_history_normalized = self.actor_obs_normalizer(proprio_history)
         proprio_features = self.proprio_encoder(proprio_history_normalized)
         
-        v_hat = self.proprio_vel_head(proprio_features)
-        z_p = self.proprio_latent_head(proprio_features)
+        proprio_mu_e_features = torch.cat([proprio_features, mu_e.detach()], dim=-1)
+        v_hat = self.proprio_vel_head(proprio_mu_e_features)
+        z_p = self.proprio_latent_head(proprio_mu_e_features)
         
         # 2. 解码
         # 2.1 高程图解码器：z_e -> 重建critic无噪声高程图
         elevation_recon = self.elevation_decoder(z_e)
         
         # 2.2 本体解码器：[z_e + z_p + v̂] -> 重建下一帧本体观测
-        decoder_input = torch.cat([z_e, z_p, v_hat], dim=-1)
+        # z_e.detach(): 高程图编码已有自己的重建任务(elevation_recon_loss)
+        # v_hat.detach(): 速度估计只受vel_loss监督，不受obs_recon_loss影响
+        # z_p不detach: 让obs_recon_loss训练本体隐变量编码器
+        decoder_input = torch.cat([z_e.detach(), z_p, v_hat.detach()], dim=-1)
         obs_recon = self.obs_decoder(decoder_input)
         
         # 3. 计算损失
@@ -609,15 +611,14 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         
         # 3.3 KL散度（VAE的正则化项）- 使用per-dimension平均而不是sum
         # 这样KL损失的scale与latent_dim无关
-        # kl_loss = -0.5 * torch.mean(torch.sum(1 + logvar_e - mu_e.pow(2) - logvar_e.exp(), dim=1))
         kl_loss = -0.5 * torch.mean(1 + logvar_e - mu_e.pow(2) - logvar_e.exp())
         
         # 3.4 速度估计损失
-        vel_target = critic_obs_next_normalized[:, 70:73]  # 假设速度在这个位置
+        vel_target = critic_obs_next_normalized[:, 70:73] 
         vel_loss = F.mse_loss(v_hat, vel_target)
         
         # 总损失
-        total_loss = elevation_recon_loss + obs_recon_loss + kl_weight * kl_loss + vel_loss
+        total_loss = elevation_recon_loss + obs_recon_loss + self.kl_weight * kl_loss + vel_loss
         
         # 4. 反向传播和优化
         encoder_optimizer.zero_grad()
@@ -801,10 +802,12 @@ class _ElevationNetMode12P2OnnxPolicyExporter(torch.nn.Module):
         elevation_features = self.elevation_vae_encoder(elevation_data)
         z_e = self.elevation_mu(elevation_features)  # 推理时使用均值
         
-        # 本体编码：5帧历史（归一化后） -> v_hat, z_p
+        # 本体编码：5帧历史（归一化后） + z_e -> v_hat, z_p
+        # 注意：训练时使用mu_e.detach()作为输入，推理时z_e本身就是detached
         proprio_features = self.proprio_encoder(proprio_history_normalized)
-        v_hat = self.proprio_vel_head(proprio_features)
-        z_p = self.proprio_latent_head(proprio_features)
+        proprio_mu_e_features = torch.cat([proprio_features, z_e], dim=-1)
+        v_hat = self.proprio_vel_head(proprio_mu_e_features)
+        z_p = self.proprio_latent_head(proprio_mu_e_features)
         
         # 融合特征
         fused_features = torch.cat([current_proprio_obs, v_hat, z_e, z_p], dim=-1)

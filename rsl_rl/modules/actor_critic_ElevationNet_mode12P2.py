@@ -614,7 +614,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         kl_loss = -0.5 * torch.mean(1 + logvar_e - mu_e.pow(2) - logvar_e.exp())
         
         # 3.4 速度估计损失
-        vel_target = critic_obs_next_normalized[:, 70:73] 
+        vel_target = critic_obs_next_normalized[:, -3:]  
         vel_loss = F.mse_loss(v_hat, vel_target)
         
         # 总损失

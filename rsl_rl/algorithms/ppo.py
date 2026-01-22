@@ -11,7 +11,18 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticEstNet, ActorCriticDWAQ, ActorCriticElevationNetMode12P2, ActorCriticElevationNetMode12L
+from rsl_rl.modules import (
+    ActorCritic,
+    ActorCriticRecurrent,
+    ActorCriticEstNet,
+    ActorCriticDWAQ,
+    ActorCriticElevationNetMode12P2,
+    ActorCriticElevationNetMode12P2_wo_v,
+    ActorCriticElevationNetMode12P2_wo_zp,
+    ActorCriticElevationNetMode12P2_2DCNN,
+    ActorCriticElevationNetMode12P2_wo_VAE,
+    ActorCriticElevationNetMode12L,
+)
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import string_to_callable, Normalizer
@@ -19,10 +30,24 @@ from typing import Any, NoReturn
 from collections import deque
 from rsl_rl.utils import AMPLoader
 
+# 类型别名：支持的所有 ActorCritic 类型
+ActorCriticType = (
+    ActorCritic
+    | ActorCriticRecurrent
+    | ActorCriticEstNet
+    | ActorCriticDWAQ
+    | ActorCriticElevationNetMode12P2
+    | ActorCriticElevationNetMode12P2_wo_v
+    | ActorCriticElevationNetMode12P2_wo_zp
+    | ActorCriticElevationNetMode12P2_2DCNN
+    | ActorCriticElevationNetMode12P2_wo_VAE
+    | ActorCriticElevationNetMode12L
+)
+
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12L
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L
     """The actor critic module."""
 
     def __init__(

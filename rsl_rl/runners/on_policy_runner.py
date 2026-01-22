@@ -21,19 +21,6 @@ from rsl_rl.modules import (
     ActorCriticRecurrent,
     ActorCriticEstNet,
     ActorCriticDWAQ,
-    ActorCriticElevationNetMode1,
-    ActorCriticElevationNetMode2,
-    ActorCriticElevationNetMode2A,
-    ActorCriticElevationNetMode3,
-    ActorCriticElevationNetMode4,
-    ActorCriticElevationNetMode5,
-    ActorCriticElevationNetMode6,
-    ActorCriticElevationNetMode7,
-    ActorCriticElevationNetMode8,
-    ActorCriticElevationNetMode9,
-    ActorCriticElevationNetMode9A,
-    ActorCriticElevationNetMode10,
-    ActorCriticElevationNetMode11,
     ActorCriticElevationNetMode12P2,
     ActorCriticElevationNetMode12L,
     # ActorCritic_DeltaSine,
@@ -49,19 +36,6 @@ ActorCriticType = (
     | ActorCriticRecurrent
     | ActorCriticEstNet
     | ActorCriticDWAQ
-    | ActorCriticElevationNetMode1
-    | ActorCriticElevationNetMode2
-    | ActorCriticElevationNetMode2A
-    | ActorCriticElevationNetMode3
-    | ActorCriticElevationNetMode4
-    | ActorCriticElevationNetMode5
-    | ActorCriticElevationNetMode6
-    | ActorCriticElevationNetMode7
-    | ActorCriticElevationNetMode8
-    | ActorCriticElevationNetMode9
-    | ActorCriticElevationNetMode9A
-    | ActorCriticElevationNetMode10
-    | ActorCriticElevationNetMode11
     | ActorCriticElevationNetMode12P2
     | ActorCriticElevationNetMode12L
 )

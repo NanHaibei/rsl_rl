@@ -22,6 +22,7 @@ from rsl_rl.modules import (
     ActorCriticElevationNetMode12P2_2DCNN,
     ActorCriticElevationNetMode12P2_wo_VAE,
     ActorCriticElevationNetMode12L,
+    ActorCriticElevationNetMode12P2CriticMLP
 )
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
@@ -42,6 +43,7 @@ ActorCriticType = (
     | ActorCriticElevationNetMode12P2_2DCNN
     | ActorCriticElevationNetMode12P2_wo_VAE
     | ActorCriticElevationNetMode12L
+    | ActorCriticElevationNetMode12P2CriticMLP
 )
 
 class PPO:
@@ -139,7 +141,8 @@ class PPO:
             type(self.policy) == ActorCriticElevationNetMode12P2_wo_zp or
             type(self.policy) == ActorCriticElevationNetMode12P2_2DCNN or
             type(self.policy) == ActorCriticElevationNetMode12P2_wo_VAE or
-            type(self.policy) == ActorCriticElevationNetMode12L
+            type(self.policy) == ActorCriticElevationNetMode12L or
+            type(self.policy) == ActorCriticElevationNetMode12P2CriticMLP
         )
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)

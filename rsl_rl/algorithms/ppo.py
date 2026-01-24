@@ -127,12 +127,20 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ或ElevationNetMode2A/3/4/5/6
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
         self.dwaq = True if type(self.policy) == ActorCriticDWAQ else False
-        self.elevation_net_mode12 = True if type(self.policy) == ActorCriticElevationNetMode12P2 else False
+        # 检查所有mode12P2的衍生版本
+        self.elevation_net_mode12 = (
+            type(self.policy) == ActorCriticElevationNetMode12P2 or
+            type(self.policy) == ActorCriticElevationNetMode12P2_wo_v or
+            type(self.policy) == ActorCriticElevationNetMode12P2_wo_zp or
+            type(self.policy) == ActorCriticElevationNetMode12P2_2DCNN or
+            type(self.policy) == ActorCriticElevationNetMode12P2_wo_VAE or
+            type(self.policy) == ActorCriticElevationNetMode12L
+        )
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)
         self.optimizer = optimizers_dict.get("optimizer")

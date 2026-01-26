@@ -22,7 +22,11 @@ from rsl_rl.modules import (
     ActorCriticElevationNetMode12P2_2DCNN,
     ActorCriticElevationNetMode12P2_wo_VAE,
     ActorCriticElevationNetMode12L,
-    ActorCriticElevationNetMode12P2CriticMLP
+    ActorCriticElevationNetMode12P2CriticMLP,
+    ActorCriticMode13A1,
+    ActorCriticMode13A2,
+    ActorCriticMode13A3,
+    ActorCriticMode13A4
 )
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
@@ -44,12 +48,16 @@ ActorCriticType = (
     | ActorCriticElevationNetMode12P2_wo_VAE
     | ActorCriticElevationNetMode12L
     | ActorCriticElevationNetMode12P2CriticMLP
+    | ActorCriticMode13A1
+    | ActorCriticMode13A2
+    | ActorCriticMode13A3
+    | ActorCriticMode13A4
 )
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4
     """The actor critic module."""
 
     def __init__(
@@ -129,7 +137,7 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4 = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ或ElevationNetMode2A/3/4/5/6
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False

@@ -26,11 +26,12 @@ from .actor_critic_ElevationNet_mode12P2_wo_v import ActorCriticElevationNetMode
 from .actor_critic_ElevationNet_mode12P2_wo_VAE import ActorCriticElevationNetMode12P2_wo_VAE
 from .actor_critic_ElevationNet_mode12P2_wo_zp import ActorCriticElevationNetMode12P2_wo_zp
 
-# Mode13: 四个新的mode实现
+# Mode13: 五个新的mode实现
 from .actor_critic_mode13A1 import ActorCriticMode13A1
 from .actor_critic_mode13A2 import ActorCriticMode13A2
 from .actor_critic_mode13A3 import ActorCriticMode13A3
 from .actor_critic_mode13A4 import ActorCriticMode13A4
+from .actor_critic_mode13A5 import ActorCriticMode13A5
 
 __all__ = [
     "ActorCritic",
@@ -55,9 +56,10 @@ __all__ = [
     "ActorCriticElevationNetMode12P2_wo_VAE",
     "ActorCriticElevationNetMode12P2CriticMLP",
     
-    # Mode13: 四个新的mode实现
+    # Mode13: 五个新的mode实现
     "ActorCriticMode13A1",
     "ActorCriticMode13A2",
     "ActorCriticMode13A3",
     "ActorCriticMode13A4",
+    "ActorCriticMode13A5",
 ]

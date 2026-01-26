@@ -26,7 +26,8 @@ from rsl_rl.modules import (
     ActorCriticMode13A1,
     ActorCriticMode13A2,
     ActorCriticMode13A3,
-    ActorCriticMode13A4
+    ActorCriticMode13A4,
+    ActorCriticMode13A5
 )
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
@@ -52,17 +53,18 @@ ActorCriticType = (
     | ActorCriticMode13A2
     | ActorCriticMode13A3
     | ActorCriticMode13A4
+    | ActorCriticMode13A5
 )
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4 | ActorCriticMode13A5
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ,
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4 | ActorCriticMode13A5,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,

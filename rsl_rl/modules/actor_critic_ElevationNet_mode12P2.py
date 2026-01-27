@@ -450,6 +450,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         sampled_height_maps = height_maps.squeeze(1) if height_maps.dim() > 4 else height_maps
         
         # 3. 编码器：获取隐变量
+        print(obs["height_scan_critic"][0,0,:])
         elevation_features = self.elevation_vae_encoder(sampled_height_maps)
         mu_e = self.elevation_mu(elevation_features)
         
@@ -702,9 +703,6 @@ class ActorCriticElevationNetMode12P2(nn.Module):
             normalizer: 归一化模块，如果为None则使用Identity
             verbose: 是否打印模型摘要，默认为False
         """
-        import copy
-        import os
-        
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
             
@@ -856,22 +854,4 @@ class _ElevationNetMode12P2OnnxPolicyExporter(torch.nn.Module):
             output_names=["actions"],
             dynamic_axes={},
         )
-    def export_to_onnx(self, path: str, filename: str = "ElevationNet_mode12P2_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将ElevationNet Mode12P2策略导出为ONNX格式
-        
-        Args:
-            path: 保存目录的路径
-            filename: 导出的ONNX文件名，默认为"ElevationNet_mode12P2_policy.onnx"
-            normalizer: 归一化模块，如果为None则使用Identity
-            verbose: 是否打印模型摘要，默认为False
-        """
-        import copy
-        import os
-        
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-            
-        # 创建ElevationNet Mode12P2专用的导出器
-        exporter = _ElevationNetMode12P2OnnxPolicyExporter(self, normalizer, verbose)
-        exporter.export(path, filename)
 

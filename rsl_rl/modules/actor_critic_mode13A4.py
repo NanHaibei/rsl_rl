@@ -514,14 +514,28 @@ class _OnnxPolicyExporter(torch.nn.Module):
         else:
             self.normalizer = torch.nn.Identity()
     
-    def forward(self, proprio_obs, elevation_obs):
+    def forward(self, obs_concat):
         """
         Args:
-            proprio_obs: 本体观测，形状为 [batch_size, proprio_obs_dim]
-            elevation_obs: 高程图，形状为 [batch_size, height, width]
+            obs_concat: 拼接的观测，形状为 [batch_size, total_dim]
+                       前面是本体观测，后面是高程图
+                       total_dim = proprio_obs_dim + height * width
         Returns:
             actions_mean: 动作均值，形状为 [batch_size, num_actions]
         """
+        batch_size = obs_concat.shape[0]
+        
+        # 计算高程图展平后的维度
+        height, width = self.vision_spatial_size
+        elevation_flat_dim = height * width
+        
+        # 从输入中切片分出本体观测和高程图
+        proprio_obs = obs_concat[:, :self.proprio_obs_dim]  # [batch_size, proprio_obs_dim]
+        elevation_flat = obs_concat[:, self.proprio_obs_dim:]  # [batch_size, height * width]
+        
+        # 将高程图重塑为 [batch_size, height, width]
+        elevation_obs = elevation_flat.view(batch_size, height, width)
+        
         # 对本体观测进行归一化
         proprio_obs = self.normalizer(proprio_obs)
         
@@ -544,8 +558,8 @@ class _OnnxPolicyExporter(torch.nn.Module):
         opset_version = 18
         
         height, width = self.vision_spatial_size
-        proprio_obs = torch.zeros(1, self.proprio_obs_dim)
-        elevation_obs = torch.zeros(1, height, width)
+        total_dim = self.proprio_obs_dim + height * width
+        obs_concat = torch.zeros(1, total_dim)
         
         print(f"\n{'='*80}")
         print(f"ONNX导出配置 (Mode13A4):")
@@ -554,22 +568,23 @@ class _OnnxPolicyExporter(torch.nn.Module):
         print(f"  本体特征维度:       {self.actor_mlp_feature_dim}")
         print(f"  视觉特征维度:       {self.vision_feature_dim}")
         print(f"  高程图维度:         ({height}, {width})")
-        print(f"  输入1: 本体观测,    shape: [batch, {self.proprio_obs_dim}]")
-        print(f"  输入2: 高程图,      shape: [batch, {height}, {width}]")
+        print(f"  总输入维度:         {total_dim}")
+        print(f"  输入: 拼接观测,     shape: [batch, {total_dim}]")
+        print(f"    - 前{self.proprio_obs_dim}维: 本体观测")
+        print(f"    - 后{height * width}维: 高程图(展平)")
         print(f"{'='*80}\n")
         
         torch.onnx.export(
             self,
-            (proprio_obs, elevation_obs),
+            obs_concat,
             os.path.join(path, filename),
             export_params=True,
             opset_version=opset_version,
             verbose=self.verbose,
-            input_names=["proprio_obs", "elevation_obs"],
+            input_names=["obs_concat"],
             output_names=["actions"],
             dynamic_axes={
-                "proprio_obs": {0: "batch_size"},
-                "elevation_obs": {0: "batch_size"},
+                "obs_concat": {0: "batch_size"},
                 "actions": {0: "batch_size"},
             },
         )

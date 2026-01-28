@@ -450,7 +450,7 @@ class ActorCriticElevationNetMode12P2(nn.Module):
         sampled_height_maps = height_maps.squeeze(1) if height_maps.dim() > 4 else height_maps
         
         # 3. 编码器：获取隐变量
-        print(obs["height_scan_critic"][0,0,:])
+        # print(obs["height_scan_critic"][0,0,:])
         elevation_features = self.elevation_vae_encoder(sampled_height_maps)
         mu_e = self.elevation_mu(elevation_features)
         

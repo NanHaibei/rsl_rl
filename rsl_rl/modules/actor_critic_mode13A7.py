@@ -96,92 +96,6 @@ class Elevation2DCNNEncoder(nn.Module):
         return x
 
 
-class VelocityEncoder(nn.Module):
-    """速度编码器：估计线速度
-    
-    结构:
-        - 本体观测历史（T帧） -> MLP -> 本体特征
-        - 高程图历史（T帧） -> 2DCNN -> 高程图特征
-        - [本体特征 + 高程图特征] -> MLP -> 线速度估计值(v̂_t, 3维)
-    """
-    
-    def __init__(
-        self,
-        num_proprio_history: int,  # 本体历史维度（T帧拼接后）
-        elevation_history_length: int = 5,
-        vision_spatial_size: tuple[int, int] = (25, 17),
-        # 本体编码器配置
-        proprio_encoder_hidden_dims: list[int] = [128, 128],
-        proprio_feature_dim: int = 64,
-        # 高程图编码器配置
-        elevation_cnn_hidden_dims: list[int] = [16, 32, 64],
-        elevation_cnn_kernel_sizes: list[int] = [3, 3, 3],
-        elevation_cnn_strides: list[int] = [2, 2, 2],
-        elevation_feature_dim: int = 64,
-        # 速度估计head配置
-        vel_estimator_hidden_dims: list[int] = [128],
-        vel_dim: int = 3,
-        activation: str = "elu",
-    ):
-        super().__init__()
-        
-        self.proprio_feature_dim = proprio_feature_dim
-        self.elevation_feature_dim = elevation_feature_dim
-        self.vel_dim = vel_dim
-        
-        # 1. 本体编码器：本体历史观测 -> MLP -> 本体特征
-        self.proprio_encoder = MLP(
-            num_proprio_history,
-            proprio_feature_dim,
-            proprio_encoder_hidden_dims,
-            activation
-        )
-        
-        # 2. 高程图编码器：高程图历史 -> 2DCNN -> 高程图特征
-        self.elevation_encoder = Elevation2DCNNEncoder(
-            in_channels=elevation_history_length,
-            hidden_dims=elevation_cnn_hidden_dims,
-            kernel_sizes=elevation_cnn_kernel_sizes,
-            strides=elevation_cnn_strides,
-            out_dim=elevation_feature_dim,
-            vision_spatial_size=vision_spatial_size
-        )
-        
-        # 3. 速度估计head：[本体特征 + 高程图特征] -> MLP -> 线速度估计值
-        vel_estimator_input_dim = proprio_feature_dim + elevation_feature_dim
-        self.vel_estimator = MLP(
-            vel_estimator_input_dim,
-            vel_dim,
-            vel_estimator_hidden_dims,
-            activation
-        )
-    
-    def forward(
-        self, 
-        proprio_history: torch.Tensor, 
-        elevation_history: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            proprio_history: 本体观测历史，形状为 [B, T*obs_dim]（已归一化）
-            elevation_history: 高程图历史，形状为 [B, T, H, W]（已归一化）
-        
-        Returns:
-            v_hat: 线速度估计值，形状为 [B, 3]
-        """
-        # 1. 提取本体特征
-        proprio_features = self.proprio_encoder(proprio_history)
-        
-        # 2. 提取高程图特征
-        elevation_features = self.elevation_encoder(elevation_history)
-        
-        # 3. 融合特征并估计速度
-        fused_features = torch.cat([proprio_features, elevation_features], dim=-1)
-        v_hat = self.vel_estimator(fused_features)
-        
-        return v_hat
-
-
 class ActorCriticMode13A7(nn.Module):
     is_recurrent: bool = False
 
@@ -320,21 +234,36 @@ class ActorCriticMode13A7(nn.Module):
         print(f"Actor 2DCNN Encoder (history length={elevation_history_length}): {self.elevation_2dcnn_encoder_actor}")
 
         # ============ Encoder部分（Mode13A7新增） ============
-        self.velocity_encoder = VelocityEncoder(
-            num_proprio_history=num_actor_obs_history,
-            elevation_history_length=elevation_history_length,
-            vision_spatial_size=vision_spatial_size,
-            proprio_encoder_hidden_dims=encoder_proprio_hidden_dims,
-            proprio_feature_dim=encoder_proprio_feature_dim,
-            elevation_cnn_hidden_dims=encoder_elevation_cnn_hidden_dims,
-            elevation_cnn_kernel_sizes=encoder_elevation_cnn_kernel_sizes,
-            elevation_cnn_strides=encoder_elevation_cnn_strides,
-            elevation_feature_dim=encoder_elevation_feature_dim,
-            vel_estimator_hidden_dims=encoder_vel_hidden_dims,
-            vel_dim=encoder_vel_dim,
-            activation=activation,
+        # 1. 本体编码器：本体历史观测 -> MLP -> 本体特征
+        self.velocity_proprio_encoder = MLP(
+            num_actor_obs_history,
+            encoder_proprio_feature_dim,
+            encoder_proprio_hidden_dims,
+            activation
         )
-        print(f"Velocity Encoder: {self.velocity_encoder}")
+        
+        # 2. 高程图编码器：高程图历史 -> 2DCNN -> 高程图特征
+        self.velocity_elevation_encoder = Elevation2DCNNEncoder(
+            in_channels=elevation_history_length,
+            hidden_dims=encoder_elevation_cnn_hidden_dims,
+            kernel_sizes=encoder_elevation_cnn_kernel_sizes,
+            strides=encoder_elevation_cnn_strides,
+            out_dim=encoder_elevation_feature_dim,
+            vision_spatial_size=vision_spatial_size
+        )
+        
+        # 3. 速度估计head：[本体特征 + 高程图特征] -> MLP -> 线速度估计值
+        vel_estimator_input_dim = encoder_proprio_feature_dim + encoder_elevation_feature_dim
+        self.velocity_estimator = MLP(
+            vel_estimator_input_dim,
+            encoder_vel_dim,
+            encoder_vel_hidden_dims,
+            activation
+        )
+        print(f"Velocity Encoder Components:")
+        print(f"  Proprio encoder: MLP({num_actor_obs_history} -> {encoder_proprio_feature_dim})")
+        print(f"  Elevation encoder: 2DCNN -> {encoder_elevation_feature_dim}")
+        print(f"  Vel estimator: MLP({vel_estimator_input_dim} -> {encoder_vel_dim})")
         print(f"  Proprio history dim: {num_actor_obs_history} ({num_actor_obs} * {elevation_history_length})")
         
         # ============ Critic网络 ============
@@ -472,7 +401,13 @@ class ActorCriticMode13A7(nn.Module):
         current_proprio_obs = proprio_obs_history[:, -self.num_proprio_one_frame:]  # [B, obs_dim]
         
         # 5. Encoder：估计线速度（使用完整T帧历史）
-        v_hat = self.velocity_encoder(proprio_obs_history, sampled_height_map)
+        # 5.1 提取本体特征
+        velocity_proprio_features = self.velocity_proprio_encoder(proprio_obs_history)
+        # 5.2 提取高程图特征
+        velocity_elevation_features = self.velocity_elevation_encoder(sampled_height_map)
+        # 5.3 融合特征并估计速度
+        velocity_fused_features = torch.cat([velocity_proprio_features, velocity_elevation_features], dim=-1)
+        v_hat = self.velocity_estimator(velocity_fused_features)
         
         # 6. 提取高程图特征（Actor 2DCNN）
         vision_features = self.elevation_2dcnn_encoder_actor(sampled_height_map)
@@ -512,7 +447,13 @@ class ActorCriticMode13A7(nn.Module):
         current_proprio_obs = proprio_obs_history[:, -self.num_proprio_one_frame:]  # [B, obs_dim]
         
         # 5. Encoder：估计线速度（使用完整T帧历史）
-        v_hat = self.velocity_encoder(proprio_obs_history, sampled_height_map)
+        # 5.1 提取本体特征
+        velocity_proprio_features = self.velocity_proprio_encoder(proprio_obs_history)
+        # 5.2 提取高程图特征
+        velocity_elevation_features = self.velocity_elevation_encoder(sampled_height_map)
+        # 5.3 融合特征并估计速度
+        velocity_fused_features = torch.cat([velocity_proprio_features, velocity_elevation_features], dim=-1)
+        v_hat = self.velocity_estimator(velocity_fused_features)
         
         # 6. 提取高程图特征（Actor 2DCNN）
         vision_features = self.elevation_2dcnn_encoder_actor(sampled_height_map)
@@ -650,8 +591,13 @@ class _OnnxPolicyExporter(torch.nn.Module):
             self.elevation_encoder = copy.deepcopy(policy.elevation_2dcnn_encoder_actor)
         if hasattr(policy, "actor_mlp_extractor"):
             self.actor_mlp_extractor = copy.deepcopy(policy.actor_mlp_extractor)
-        if hasattr(policy, "velocity_encoder"):
-            self.velocity_encoder = copy.deepcopy(policy.velocity_encoder)
+        # 复制velocity encoder的三个组件
+        if hasattr(policy, "velocity_proprio_encoder"):
+            self.velocity_proprio_encoder = copy.deepcopy(policy.velocity_proprio_encoder)
+        if hasattr(policy, "velocity_elevation_encoder"):
+            self.velocity_elevation_encoder = copy.deepcopy(policy.velocity_elevation_encoder)
+        if hasattr(policy, "velocity_estimator"):
+            self.velocity_estimator = copy.deepcopy(policy.velocity_estimator)
         
         # 从actor获取相关维度
         self.vision_feature_dim = policy.vision_feature_dim
@@ -697,7 +643,13 @@ class _OnnxPolicyExporter(torch.nn.Module):
         # 临时方案：使用单帧重复T次作为历史
         proprio_history = proprio_obs.unsqueeze(1).repeat(1, history_length, 1)  # [B, T, obs_dim]
         proprio_history = proprio_history.reshape(batch_size, -1)  # [B, T*obs_dim]
-        v_hat = self.velocity_encoder(proprio_history, elevation_obs)
+        # 1. 提取本体特征
+        velocity_proprio_features = self.velocity_proprio_encoder(proprio_history)
+        # 2. 提取高程图特征
+        velocity_elevation_features = self.velocity_elevation_encoder(elevation_obs)
+        # 3. 融合特征并估计速度
+        velocity_fused_features = torch.cat([velocity_proprio_features, velocity_elevation_features], dim=-1)
+        v_hat = self.velocity_estimator(velocity_fused_features)
         
         # 提取本体特征（MLP）
         proprio_features = self.actor_mlp_extractor(proprio_obs)

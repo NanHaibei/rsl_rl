@@ -21,19 +21,7 @@ from rsl_rl.modules import (
     ActorCriticRecurrent,
     ActorCriticEstNet,
     ActorCriticDWAQ,
-    ActorCriticElevationNetMode12P2,
-    ActorCriticElevationNetMode12L,
-    ActorCriticElevationNetMode12P2_2DCNN,
-    ActorCriticElevationNetMode12P2CriticMLP,
-    ActorCriticElevationNetMode12P2_wo_v,
-    ActorCriticElevationNetMode12P2_wo_VAE,
-    ActorCriticElevationNetMode12P2_wo_zp,
-    ActorCriticMode13A1,
-    ActorCriticMode13A2,
-    ActorCriticMode13A3,
-    ActorCriticMode13A4,
-    ActorCriticMode13A5,
-    # ActorCritic_DeltaSine,
+    ActorCriticECMM,
     AMPDiscriminator,
     resolve_rnd_config,
     resolve_symmetry_config
@@ -46,18 +34,7 @@ ActorCriticType = (
     | ActorCriticRecurrent
     | ActorCriticEstNet
     | ActorCriticDWAQ
-    | ActorCriticElevationNetMode12P2
-    | ActorCriticElevationNetMode12L
-    | ActorCriticElevationNetMode12P2_2DCNN
-    | ActorCriticElevationNetMode12P2CriticMLP
-    | ActorCriticElevationNetMode12P2_wo_v
-    | ActorCriticElevationNetMode12P2_wo_VAE
-    | ActorCriticElevationNetMode12P2_wo_zp
-    | ActorCriticMode13A1
-    | ActorCriticMode13A2
-    | ActorCriticMode13A3
-    | ActorCriticMode13A4
-    | ActorCriticMode13A5
+    | ActorCriticECMM
 )
 
 

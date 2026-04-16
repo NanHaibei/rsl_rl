@@ -4,16 +4,21 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-ActorCriticMode13A3: 2DCNN处理单帧高程图 + MLP提取本体特征
+ActorCriticECMM: Actor和Critic都用2DCNN处理多帧高程图历史（作为通道）
 
 网络结构:
     Critic Pipeline:
-    - 单帧本体特权观测 + 单帧高程图(展平) -> 直接concat -> Critic网络 -> Value
+    - 单帧本体特权观测 + 多帧高程图历史(2DCNN提取特征) -> concat -> Critic网络 -> Value
     
     Actor Pipeline:
-    - 单帧高程图 -> 2DCNN提取特征
+    - 多帧高程图历史 -> 2DCNN提取特征
     - 本体观测 -> MLP提取特征
     - 本体特征 + 视觉特征 -> concat -> Actor网络 -> Actions
+    
+    相比Mode13A4的改进：
+    - 高程图输入从单帧改为多帧历史（如5帧）
+    - 历史帧作为通道维度处理：输入 [B, T, H, W] 而非 [B, H, W]
+    - CNN自动学习时序特征
 """
 
 from __future__ import annotations
@@ -30,9 +35,10 @@ import os
 
 
 class Elevation2DCNNEncoder(nn.Module):
-    """2DCNN编码器，用于处理单帧高程图"""
+    """2DCNN编码器，用于处理多帧高程图历史（作为通道）"""
     
     def __init__(self, 
+                 in_channels=1,  # 历史帧数，如5
                  hidden_dims=[16, 32, 64],
                  kernel_sizes=[3, 3, 3],
                  strides=[2, 2, 2],
@@ -42,11 +48,10 @@ class Elevation2DCNNEncoder(nn.Module):
         
         # 构建2DCNN卷积层
         layers = []
-        in_channels = 1  # 单通道高程图
-        
+        now_channels = in_channels
         for i, (hidden_dim, kernel_size, stride) in enumerate(zip(hidden_dims, kernel_sizes, strides)):
             layers.append(nn.Conv2d(
-                in_channels, 
+                now_channels, 
                 hidden_dim, 
                 kernel_size=kernel_size,
                 stride=stride,
@@ -54,13 +59,13 @@ class Elevation2DCNNEncoder(nn.Module):
             ))
             layers.append(nn.BatchNorm2d(hidden_dim))
             layers.append(nn.ReLU(inplace=True))
-            in_channels = hidden_dim
+            now_channels = hidden_dim
         
         self.conv = nn.Sequential(*layers)
         
         # 计算经过卷积后的特征维度
         with torch.no_grad():
-            dummy_input = torch.zeros(1, 1, vision_spatial_size[0], vision_spatial_size[1])
+            dummy_input = torch.zeros(1, in_channels, vision_spatial_size[0], vision_spatial_size[1])
             dummy_output = self.conv(dummy_input)
             conv_output_size = dummy_output.numel()
         
@@ -69,14 +74,13 @@ class Elevation2DCNNEncoder(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [B, H, W] 单帧高程图（已归一化）
+            x: [B, T, H, W] 多帧高程图历史（已归一化），T为历史帧数
         Returns:
             features: [B, out_dim] 特征向量
         """
-        # 添加通道维度: [B, H, W] -> [B, 1, H, W]
-        x = x.unsqueeze(1)
+        # 不需要添加通道维度，输入已经是 [B, T, H, W] 格式
+        # 直接通过2DCNN，CNN会处理T个通道
         
-        # 通过2DCNN
         x = self.conv(x)
         
         # 展平并通过全连接层
@@ -86,7 +90,7 @@ class Elevation2DCNNEncoder(nn.Module):
         return x
 
 
-class ActorCriticMode13A3(nn.Module):
+class ActorCriticECMM(nn.Module):
     is_recurrent: bool = False
 
     def __init__(
@@ -107,10 +111,16 @@ class ActorCriticMode13A3(nn.Module):
         # 高程图编码器配置
         vision_spatial_size: tuple[int, int] = (25, 17),
         vision_feature_dim: int = 64,
-        # 2DCNN配置
-        cnn_hidden_dims: list[int] = [16, 32, 64],
-        cnn_kernel_sizes: list[int] = [3, 3, 3],
-        cnn_strides: list[int] = [2, 2, 2],
+        # 高程图历史长度
+        elevation_history_length: int = 5,
+        # Actor 2DCNN配置
+        actor_cnn_hidden_dims: list[int] = [16, 32, 64],
+        actor_cnn_kernel_sizes: list[int] = [3, 3, 3],
+        actor_cnn_strides: list[int] = [2, 2, 2],
+        # Critic 2DCNN配置（默认使用相同配置）
+        critic_cnn_hidden_dims: list[int] = None,
+        critic_cnn_kernel_sizes: list[int] = None,
+        critic_cnn_strides: list[int] = None,
         # Actor MLP特征提取器配置
         actor_mlp_feature_dim: int = 64,
         actor_mlp_hidden_dims: tuple[int] | list[int] = [128],
@@ -129,6 +139,15 @@ class ActorCriticMode13A3(nn.Module):
         self.vision_spatial_size = vision_spatial_size
         self.vision_feature_dim = vision_feature_dim
         self.actor_mlp_feature_dim = actor_mlp_feature_dim
+        self.elevation_history_length = elevation_history_length
+        
+        # Critic CNN配置（如果没有指定，则使用Actor的配置）
+        if critic_cnn_hidden_dims is None:
+            critic_cnn_hidden_dims = actor_cnn_hidden_dims
+        if critic_cnn_kernel_sizes is None:
+            critic_cnn_kernel_sizes = actor_cnn_kernel_sizes
+        if critic_cnn_strides is None:
+            critic_cnn_strides = actor_cnn_strides
         
         # Get the observation dimensions
         self.obs_groups = obs_groups
@@ -149,9 +168,8 @@ class ActorCriticMode13A3(nn.Module):
         # Actor输入维度 = 本体特征 + 视觉特征
         actor_input_dim = actor_mlp_feature_dim + vision_feature_dim
         
-        # Critic输入维度 = 本体特权观测 + 展平的高程图
-        elevation_dim_critic = vision_spatial_size[0] * vision_spatial_size[1]
-        critic_input_dim = num_critic_obs + elevation_dim_critic
+        # Critic输入维度 = 本体特权观测 + 视觉特征(通过2DCNN提取)
+        critic_input_dim = num_critic_obs + vision_feature_dim
 
         self.state_dependent_std = state_dependent_std
 
@@ -180,20 +198,32 @@ class ActorCriticMode13A3(nn.Module):
         print(f"Actor MLP Extractor: {self.actor_mlp_extractor}")
         print(f"  Extractor input dim: {num_actor_obs} -> output dim: {actor_mlp_feature_dim}")
         
-        # 2DCNN编码器：单帧高程图 -> 2DCNN -> 视觉特征
-        self.elevation_2dcnn_encoder = Elevation2DCNNEncoder(
-            hidden_dims=cnn_hidden_dims,
-            kernel_sizes=cnn_kernel_sizes,
-            strides=cnn_strides,
+        # Actor 2DCNN编码器：多帧高程图历史 -> 2DCNN -> 视觉特征
+        self.elevation_2dcnn_encoder_actor = Elevation2DCNNEncoder(
+            in_channels=elevation_history_length,  # 输入通道数 = 历史帧数
+            hidden_dims=actor_cnn_hidden_dims,
+            kernel_sizes=actor_cnn_kernel_sizes,
+            strides=actor_cnn_strides,
             out_dim=vision_feature_dim,
             vision_spatial_size=vision_spatial_size
         )
-        print(f"2DCNN Encoder: {self.elevation_2dcnn_encoder}")
+        print(f"Actor 2DCNN Encoder (history length={elevation_history_length}): {self.elevation_2dcnn_encoder_actor}")
+        
+        # Critic 2DCNN编码器：多帧高程图历史 -> 2DCNN -> 视觉特征
+        self.elevation_2dcnn_encoder_critic = Elevation2DCNNEncoder(
+            in_channels=elevation_history_length,  # 输入通道数 = 历史帧数
+            hidden_dims=critic_cnn_hidden_dims,
+            kernel_sizes=critic_cnn_kernel_sizes,
+            strides=critic_cnn_strides,
+            out_dim=vision_feature_dim,
+            vision_spatial_size=vision_spatial_size
+        )
+        print(f"Critic 2DCNN Encoder (history length={elevation_history_length}): {self.elevation_2dcnn_encoder_critic}")
 
-        # Critic网络：本体特权观测 + 展平的高程图 -> MLP -> 价值
+        # Critic网络：本体特权观测 + 视觉特征(2DCNN提取) -> MLP -> 价值
         self.critic = MLP(critic_input_dim, 1, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
-        print(f"  Critic input dim: {critic_input_dim} (proprio: {num_critic_obs} + elevation flat: {elevation_dim_critic})")
+        print(f"  Critic input dim: {critic_input_dim} (proprio: {num_critic_obs} + vision feature: {vision_feature_dim})")
 
         # Critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
@@ -272,20 +302,19 @@ class ActorCriticMode13A3(nn.Module):
         self.distribution = Normal(mean, std)
     
     def _normalize_elevation_map(self, height_map: torch.Tensor) -> torch.Tensor:
-        """归一化高程图
+        """归一化多帧高程图历史
         
         Args:
-            height_map: 高程图，形状为 [B, 1, H, W] 或 [B, H, W]
+            height_map: 高程图历史，形状为 [B, T, H, W]，T为历史帧数
         
         Returns:
-            归一化后的高程图，形状与输入相同
+            归一化后的高程图历史，形状与输入相同
         """
-        # 如果有通道维度，先squeeze掉: [B, 1, H, W] -> [B, H, W]
-        if height_map.dim() == 4:
-            height_map = height_map.squeeze(1)
+        # 输入应该是 [B, T, H, W] 格式
+        # 对每个历史帧分别归一化
         
-        # 归一化
-        height_map_mean = height_map.mean(dim=(-2, -1), keepdim=True)
+        # 归一化：对每个历史帧计算均值
+        height_map_mean = height_map.mean(dim=(-2, -1), keepdim=True)  # [B, T, 1, 1]
         height_map = torch.clip((height_map - height_map_mean) / 0.6, -3.0, 3.0)
         
         return height_map
@@ -294,22 +323,22 @@ class ActorCriticMode13A3(nn.Module):
         """训练时的动作采样
         
         处理流程：
-        1. 提取单帧高程图 -> 归一化 -> 2DCNN -> 视觉特征
+        1. 提取多帧高程图历史 -> 归一化 -> Actor 2DCNN -> 视觉特征
         2. 提取本体观测 -> 归一化 -> MLP -> 本体特征
         3. concat本体特征和视觉特征 -> Actor网络 -> 动作
         """
-        # 1. 提取高程图和本体观测
-        height_map = obs["height_scan_policy"]
+        # 1. 提取高程图历史和本体观测
+        height_map = obs["height_scan_policy"]  # [B, T, H, W]
         current_proprio_obs = obs["policy"]
         
-        # 2. 对高程图进行归一化
+        # 2. 对高程图历史进行归一化
         sampled_height_map = self._normalize_elevation_map(height_map)
         
         # 3. 应用观测归一化到本体观测
         current_proprio_obs = self.actor_obs_normalizer(current_proprio_obs)
         
-        # 4. 提取高程图特征（2DCNN）
-        vision_features = self.elevation_2dcnn_encoder(sampled_height_map)
+        # 4. 提取高程图特征（Actor 2DCNN）
+        vision_features = self.elevation_2dcnn_encoder_actor(sampled_height_map)
         
         # 5. 提取本体特征（MLP）
         proprio_features = self.actor_mlp_extractor(current_proprio_obs)
@@ -326,22 +355,22 @@ class ActorCriticMode13A3(nn.Module):
         """推理时的确定性动作
         
         处理流程：
-        1. 提取单帧高程图 -> 归一化 -> 2DCNN -> 视觉特征
+        1. 提取多帧高程图历史 -> 归一化 -> Actor 2DCNN -> 视觉特征
         2. 提取本体观测 -> 归一化 -> MLP -> 本体特征
         3. concat本体特征和视觉特征 -> Actor网络 -> 动作
         """
-        # 1. 提取高程图和本体观测
-        height_map = obs["height_scan_policy"]
+        # 1. 提取高程图历史和本体观测
+        height_map = obs["height_scan_policy"]  # [B, T, H, W]
         current_proprio_obs = obs["policy"]
         
-        # 2. 对高程图进行归一化
+        # 2. 对高程图历史进行归一化
         sampled_height_map = self._normalize_elevation_map(height_map)
         
         # 3. 应用观测归一化到本体观测
         current_proprio_obs = self.actor_obs_normalizer(current_proprio_obs)
         
-        # 4. 提取高程图特征（2DCNN）
-        vision_features = self.elevation_2dcnn_encoder(sampled_height_map)
+        # 4. 提取高程图特征（Actor 2DCNN）
+        vision_features = self.elevation_2dcnn_encoder_actor(sampled_height_map)
         
         # 5. 提取本体特征（MLP）
         proprio_features = self.actor_mlp_extractor(current_proprio_obs)
@@ -359,25 +388,25 @@ class ActorCriticMode13A3(nn.Module):
         """评估状态价值
         
         处理流程：
-        1. 提取单帧高程图 -> 归一化 -> 展平
+        1. 提取多帧高程图历史 -> 归一化 -> Critic 2DCNN -> 视觉特征
         2. 提取本体特权观测 -> 归一化
-        3. concat本体观测和展平的高程图 -> Critic网络 -> 价值
+        3. concat本体观测和视觉特征 -> Critic网络 -> 价值
         """
-        # 1. 提取高程图和本体观测
-        height_map = obs["height_scan_critic"]
+        # 1. 提取高程图历史和本体观测
+        height_map = obs["height_scan_critic"]  # [B, T, H, W]
         current_proprio_obs = obs["critic"]
         
-        # 2. 对高程图进行归一化
+        # 2. 对高程图历史进行归一化
         sampled_height_map = self._normalize_elevation_map(height_map)
         
         # 3. 应用观测归一化到本体观测
         current_proprio_obs = self.critic_obs_normalizer(current_proprio_obs)
         
-        # 4. 展平高程图: [B, H, W] -> [B, H*W]
-        height_map_flat = sampled_height_map.flatten(1)
+        # 4. 提取高程图特征（Critic 2DCNN）
+        vision_features = self.elevation_2dcnn_encoder_critic(sampled_height_map)
         
-        # 5. 融合本体观测和展平的高程图
-        fused_features = torch.cat((current_proprio_obs, height_map_flat), dim=-1)
+        # 5. 融合本体观测和视觉特征
+        fused_features = torch.cat((current_proprio_obs, vision_features), dim=-1)
         
         # 6. Critic输出价值
         return self.critic(fused_features)
@@ -463,17 +492,17 @@ class ActorCriticMode13A3(nn.Module):
 
 
 class _OnnxPolicyExporter(torch.nn.Module):
-    """Mode13A3的ONNX导出器"""
+    """ECMM的ONNX导出器"""
     
-    def __init__(self, policy: ActorCriticMode13A3, normalizer=None, verbose=False):
+    def __init__(self, policy: ActorCriticECMM, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
         
         # 复制策略参数
         if hasattr(policy, "actor"):
             self.actor = copy.deepcopy(policy.actor)
-        if hasattr(policy, "elevation_2dcnn_encoder"):
-            self.elevation_encoder = copy.deepcopy(policy.elevation_2dcnn_encoder)
+        if hasattr(policy, "elevation_2dcnn_encoder_actor"):
+            self.elevation_encoder = copy.deepcopy(policy.elevation_2dcnn_encoder_actor)
         if hasattr(policy, "actor_mlp_extractor"):
             self.actor_mlp_extractor = copy.deepcopy(policy.actor_mlp_extractor)
         
@@ -482,6 +511,7 @@ class _OnnxPolicyExporter(torch.nn.Module):
         self.actor_mlp_feature_dim = policy.actor_mlp_feature_dim
         self.proprio_obs_dim = policy.actor_mlp_extractor[0].in_features
         self.vision_spatial_size = policy.vision_spatial_size
+        self.elevation_history_length = policy.elevation_history_length
 
         # 复制归一化器
         if normalizer:
@@ -489,27 +519,46 @@ class _OnnxPolicyExporter(torch.nn.Module):
         else:
             self.normalizer = torch.nn.Identity()
     
+    def _normalize_elevation_map(self, height_map: torch.Tensor) -> torch.Tensor:
+        """归一化多帧高程图历史
+        
+        Args:
+            height_map: 高程图历史，形状为 [B, T, H, W]，T为历史帧数
+        
+        Returns:
+            归一化后的高程图历史，形状与输入相同
+        """
+        # 对每个历史帧分别归一化
+        height_map_mean = height_map.mean(dim=(-2, -1), keepdim=True)  # [B, T, 1, 1]
+        height_map = torch.clip((height_map - height_map_mean) / 0.6, -3.0, 3.0)
+        
+        return height_map
+    
     def forward(self, obs_concat):
         """
         Args:
             obs_concat: 拼接的观测，形状为 [batch_size, total_dim]
-                       前面是本体观测，后面是高程图
-                       total_dim = proprio_obs_dim + height * width
+                       前面是本体观测，后面是高程图历史
+                       total_dim = proprio_obs_dim + history_length * height * width
         Returns:
             actions_mean: 动作均值，形状为 [batch_size, num_actions]
         """
         batch_size = obs_concat.shape[0]
         
         # 计算高程图展平后的维度
+        history_length = self.elevation_history_length
         height, width = self.vision_spatial_size
-        elevation_flat_dim = height * width
+        elevation_flat_dim = history_length * height * width
         
         # 从输入中切片分出本体观测和高程图
         proprio_obs = obs_concat[:, :self.proprio_obs_dim]  # [batch_size, proprio_obs_dim]
-        elevation_flat = obs_concat[:, self.proprio_obs_dim:]  # [batch_size, height * width]
+        elevation_flat = obs_concat[:, self.proprio_obs_dim:]  # [batch_size, history_length * height * width]
         
-        # 将高程图重塑为 [batch_size, height, width]
-        elevation_obs = elevation_flat.view(batch_size, height, width)
+        # 将高程图重塑为 [batch_size, history_length, height, width]
+        elevation_obs = elevation_flat.view(batch_size, history_length, height, width)
+        
+        # 对高程图历史进行归一化
+        elevation_obs = self._normalize_elevation_map(elevation_obs)
         
         # 对本体观测进行归一化
         proprio_obs = self.normalizer(proprio_obs)
@@ -517,7 +566,7 @@ class _OnnxPolicyExporter(torch.nn.Module):
         # 提取本体特征（MLP）
         proprio_features = self.actor_mlp_extractor(proprio_obs)
         
-        # 对高程图进行2DCNN编码
+        # 对高程图历史进行2DCNN编码（输入已经是多通道格式）
         vision_features = self.elevation_encoder(elevation_obs)
         
         # 融合本体特征和视觉特征
@@ -532,21 +581,23 @@ class _OnnxPolicyExporter(torch.nn.Module):
         self.eval()
         opset_version = 18
         
+        history_length = self.elevation_history_length
         height, width = self.vision_spatial_size
-        total_dim = self.proprio_obs_dim + height * width
+        total_dim = self.proprio_obs_dim + history_length * height * width
         obs_concat = torch.zeros(1, total_dim)
         
         print(f"\n{'='*80}")
-        print(f"ONNX导出配置 (Mode13A3):")
+        print(f"ONNX导出配置 (ECMM):")
         print(f"{'='*80}")
         print(f"  本体观测维度:       {self.proprio_obs_dim}")
         print(f"  本体特征维度:       {self.actor_mlp_feature_dim}")
         print(f"  视觉特征维度:       {self.vision_feature_dim}")
-        print(f"  高程图维度:         ({height}, {width})")
+        print(f"  高程图历史长度:     {history_length}")
+        print(f"  高程图空间维度:     ({height}, {width})")
         print(f"  总输入维度:         {total_dim}")
         print(f"  输入: 拼接观测,     shape: [batch, {total_dim}]")
         print(f"    - 前{self.proprio_obs_dim}维: 本体观测")
-        print(f"    - 后{height * width}维: 高程图(展平)")
+        print(f"    - 后{history_length * height * width}维: 高程图历史(展平)")
         print(f"{'='*80}\n")
         
         torch.onnx.export(

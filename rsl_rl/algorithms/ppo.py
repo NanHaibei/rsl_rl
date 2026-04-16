@@ -16,18 +16,7 @@ from rsl_rl.modules import (
     ActorCriticRecurrent,
     ActorCriticEstNet,
     ActorCriticDWAQ,
-    ActorCriticElevationNetMode12P2,
-    ActorCriticElevationNetMode12P2_wo_v,
-    ActorCriticElevationNetMode12P2_wo_zp,
-    ActorCriticElevationNetMode12P2_2DCNN,
-    ActorCriticElevationNetMode12P2_wo_VAE,
-    ActorCriticElevationNetMode12L,
-    ActorCriticElevationNetMode12P2CriticMLP,
-    ActorCriticMode13A1,
-    ActorCriticMode13A2,
-    ActorCriticMode13A3,
-    ActorCriticMode13A4,
-    ActorCriticMode13A5
+    ActorCriticECMM
 )
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
@@ -42,29 +31,18 @@ ActorCriticType = (
     | ActorCriticRecurrent
     | ActorCriticEstNet
     | ActorCriticDWAQ
-    | ActorCriticElevationNetMode12P2
-    | ActorCriticElevationNetMode12P2_wo_v
-    | ActorCriticElevationNetMode12P2_wo_zp
-    | ActorCriticElevationNetMode12P2_2DCNN
-    | ActorCriticElevationNetMode12P2_wo_VAE
-    | ActorCriticElevationNetMode12L
-    | ActorCriticElevationNetMode12P2CriticMLP
-    | ActorCriticMode13A1
-    | ActorCriticMode13A2
-    | ActorCriticMode13A3
-    | ActorCriticMode13A4
-    | ActorCriticMode13A5
+    | ActorCriticECMM
 )
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4 | ActorCriticMode13A5
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticECMM
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4 | ActorCriticMode13A5,
+        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticECMM,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -139,21 +117,12 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticElevationNetMode12P2 | ActorCriticElevationNetMode12P2_wo_v | ActorCriticElevationNetMode12P2_wo_zp | ActorCriticElevationNetMode12P2_2DCNN | ActorCriticElevationNetMode12P2_wo_VAE | ActorCriticElevationNetMode12L | ActorCriticMode13A1 | ActorCriticMode13A2 | ActorCriticMode13A3 | ActorCriticMode13A4 = policy
+        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ = policy
         self.policy.to(self.device)
-        # 如果使用了EstNet、DWAQ或ElevationNetMode2A/3/4/5/6
+        # 如果使用了EstNet、DWAQ
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
         self.dwaq = True if type(self.policy) == ActorCriticDWAQ else False
-        # 检查所有mode12P2的衍生版本
-        self.elevation_net_mode12 = (
-            type(self.policy) == ActorCriticElevationNetMode12P2 or
-            type(self.policy) == ActorCriticElevationNetMode12P2_wo_v or
-            type(self.policy) == ActorCriticElevationNetMode12P2_wo_zp or
-            type(self.policy) == ActorCriticElevationNetMode12P2_2DCNN or
-            type(self.policy) == ActorCriticElevationNetMode12P2_wo_VAE or
-            # type(self.policy) == ActorCriticElevationNetMode12L or
-            type(self.policy) == ActorCriticElevationNetMode12P2CriticMLP
-        )
+
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)
         self.optimizer = optimizers_dict.get("optimizer")
@@ -429,7 +398,7 @@ class PPO:
                             param_group["lr"] = self.learning_rate
 
             # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5/6/7/8/10/11/12)
-            if self.estnet or self.dwaq or self.elevation_net_mode12:
+            if self.estnet or self.dwaq:
                 encoder_losses = self.policy.update_encoder(
                     obs_batch, 
                     next_observations_batch, 
@@ -644,7 +613,7 @@ class PPO:
             model_params.append(self.rnd.predictor.state_dict())
         # 添加encoder_optimizer相关参数的广播（修复mode7双卡训练问题）
         if self.encoder_optimizer is not None:
-            # 获取encoder相关的参数状态
+            # 获取encoder相关的参数状态 TODO: 需要进行自动化
             encoder_params_dict = {}
             # 从policy中获取encoder相关的参数
             if hasattr(self.policy, 'proprio_encoder'):

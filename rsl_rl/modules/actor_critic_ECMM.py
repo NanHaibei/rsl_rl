@@ -31,6 +31,7 @@ from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
+import math
 import os
 
 
@@ -109,10 +110,7 @@ class ActorCriticECMM(nn.Module):
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
         # 高程图编码器配置
-        vision_spatial_size: tuple[int, int] = (25, 17),
         vision_feature_dim: int = 64,
-        # 高程图历史长度
-        elevation_history_length: int = 5,
         # Actor 2DCNN配置
         actor_cnn_hidden_dims: list[int] = [16, 32, 64],
         actor_cnn_kernel_sizes: list[int] = [3, 3, 3],
@@ -136,10 +134,16 @@ class ActorCriticECMM(nn.Module):
         self.extra_info = dict()
         
         # 高程图相关配置
-        self.vision_spatial_size = vision_spatial_size
+        height_scanner_pattern_cfg = env_cfg.scene.height_scanner.pattern_cfg
+        scan_size = height_scanner_pattern_cfg.size
+        scan_resolution = height_scanner_pattern_cfg.resolution
+        self.vision_spatial_size = (
+            math.ceil((float(scan_size[0]) + 1.0e-9) / float(scan_resolution)),
+            math.ceil((float(scan_size[1]) + 1.0e-9) / float(scan_resolution)),
+        )
         self.vision_feature_dim = vision_feature_dim
         self.actor_mlp_feature_dim = actor_mlp_feature_dim
-        self.elevation_history_length = elevation_history_length
+        self.elevation_history_length = env_cfg.observations.height_scan_policy.height_scan.params["total_frames"]
         
         # Critic CNN配置（如果没有指定，则使用Actor的配置）
         if critic_cnn_hidden_dims is None:
@@ -200,25 +204,25 @@ class ActorCriticECMM(nn.Module):
         
         # Actor 2DCNN编码器：多帧高程图历史 -> 2DCNN -> 视觉特征
         self.elevation_2dcnn_encoder_actor = Elevation2DCNNEncoder(
-            in_channels=elevation_history_length,  # 输入通道数 = 历史帧数
+            in_channels=self.elevation_history_length,  # 输入通道数 = 历史帧数
             hidden_dims=actor_cnn_hidden_dims,
             kernel_sizes=actor_cnn_kernel_sizes,
             strides=actor_cnn_strides,
             out_dim=vision_feature_dim,
-            vision_spatial_size=vision_spatial_size
+            vision_spatial_size=self.vision_spatial_size
         )
-        print(f"Actor 2DCNN Encoder (history length={elevation_history_length}): {self.elevation_2dcnn_encoder_actor}")
+        print(f"Actor 2DCNN Encoder (history length={self.elevation_history_length}): {self.elevation_2dcnn_encoder_actor}")
         
         # Critic 2DCNN编码器：多帧高程图历史 -> 2DCNN -> 视觉特征
         self.elevation_2dcnn_encoder_critic = Elevation2DCNNEncoder(
-            in_channels=elevation_history_length,  # 输入通道数 = 历史帧数
+            in_channels=self.elevation_history_length,  # 输入通道数 = 历史帧数
             hidden_dims=critic_cnn_hidden_dims,
             kernel_sizes=critic_cnn_kernel_sizes,
             strides=critic_cnn_strides,
             out_dim=vision_feature_dim,
-            vision_spatial_size=vision_spatial_size
+            vision_spatial_size=self.vision_spatial_size
         )
-        print(f"Critic 2DCNN Encoder (history length={elevation_history_length}): {self.elevation_2dcnn_encoder_critic}")
+        print(f"Critic 2DCNN Encoder (history length={self.elevation_history_length}): {self.elevation_2dcnn_encoder_critic}")
 
         # Critic网络：本体特权观测 + 视觉特征(2DCNN提取) -> MLP -> 价值
         self.critic = MLP(critic_input_dim, 1, critic_hidden_dims, activation)

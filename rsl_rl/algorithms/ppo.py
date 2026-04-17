@@ -37,12 +37,12 @@ ActorCriticType = (
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticECMM
+    policy: ActorCriticType
     """The actor critic module."""
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ | ActorCriticECMM,
+        policy: ActorCriticType,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -117,7 +117,7 @@ class PPO:
             self.symmetry = None
 
         # PPO components
-        self.policy: ActorCritic | ActorCriticRecurrent | ActorCriticEstNet | ActorCriticDWAQ = policy
+        self.policy: ActorCriticType = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ
         self.estnet = True if type(self.policy) == ActorCriticEstNet else False
@@ -397,7 +397,8 @@ class PPO:
                         for param_group in self.encoder_optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
-            # Encoder update step (统一接口，适用于EstNet、DWAQ、ElevationNetMode3/4/5/6/7/8/10/11/12)
+            # Encoder update step (统一接口，适用于EstNet、DWAQ)
+            # TODO: 目前这样的写法不但污染总的梯度Norm，还没有进行多卡梯度同步
             if self.estnet or self.dwaq:
                 encoder_losses = self.policy.update_encoder(
                     obs_batch, 

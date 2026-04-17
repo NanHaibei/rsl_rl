@@ -13,8 +13,8 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import resolve_symmetry_config
 
-from .actor_critic_EstNet import ActorCriticEstNet
-from .actor_critic_DWAQ import ActorCriticDWAQ
+from .actor_critic_AE import ActorCriticAE
+from .actor_critic_VAE import ActorCriticVAE
 from .amp_discriminator import AMPDiscriminator
 
 
@@ -30,9 +30,9 @@ __all__ = [
     "resolve_rnd_config",
     "resolve_symmetry_config",
 
-    "ActorCriticEstNet",
-    "ActorCriticDWAQ",
-    "AMPDiscriminator",
-    
+    "ActorCriticAE",
+    "ActorCriticVAE",
     "ActorCriticECMM",
+    
+    "AMPDiscriminator",
 ]

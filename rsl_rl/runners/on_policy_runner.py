@@ -19,8 +19,8 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
-    ActorCriticEstNet,
-    ActorCriticDWAQ,
+    ActorCriticAE,
+    ActorCriticVAE,
     ActorCriticECMM,
     AMPDiscriminator,
     resolve_rnd_config,
@@ -32,8 +32,8 @@ from rsl_rl.utils import resolve_obs_groups, store_code_state, AMPLoader
 ActorCriticType = (
     ActorCritic
     | ActorCriticRecurrent
-    | ActorCriticEstNet
-    | ActorCriticDWAQ
+    | ActorCriticAE
+    | ActorCriticVAE
     | ActorCriticECMM
 )
 

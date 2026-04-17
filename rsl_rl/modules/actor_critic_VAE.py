@@ -15,7 +15,7 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
 import os
 
-class ActorCriticDWAQ(nn.Module):
+class ActorCriticVAE(nn.Module):
     is_recurrent: bool = False
 
     def __init__(
@@ -44,7 +44,7 @@ class ActorCriticDWAQ(nn.Module):
     ) -> None:
         if kwargs:
             print(
-                "ActorCritic_DWAQ.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
+                "ActorCritic_VAE.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
             )
         super().__init__()
 
@@ -233,6 +233,9 @@ class ActorCriticDWAQ(nn.Module):
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
         code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(actor_obs)
+        # TODO: 如果 policy history 改为 IsaacLab 内置 history，CircularBuffer 展平顺序是旧帧在前、最新帧在最后。
+        # 当前这里仍按“最新帧在最前面”的假设取 actor_obs[:, 0:self.obs_one_frame_len]。
+        # 后续需要同步改为取最后一帧，并一起调整 decoder target 和 export wrapper 的切片。
         now_obs = actor_obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
         
         # 根据条件决定是否使用adaboot
@@ -264,6 +267,7 @@ class ActorCriticDWAQ(nn.Module):
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
+        # TODO: 同步上面的 policy history 顺序后，这里也需要改为取最后一帧。
         now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
         observation = torch.cat((vel_mean.detach(), latent_mean.detach(), now_obs),dim=-1)
         # 记录速度估计值
@@ -320,7 +324,7 @@ class ActorCriticDWAQ(nn.Module):
         encoder_optimizer: torch.optim.Optimizer, 
         max_grad_norm: float
     ) -> dict[str, float]:
-        """计算DWAQ编码器损失并更新参数
+        """计算VAE编码器损失并更新参数
         
         Args:
             obs_batch: 当前观测批次数据
@@ -346,6 +350,7 @@ class ActorCriticDWAQ(nn.Module):
         # 获取下一时刻观测，提取目标观测
         next_observations = self.get_actor_obs(next_observations_batch) # TODO：应该使用critic的无噪声观测值才对
         next_observations = self.actor_obs_normalizer(next_observations)
+        # TODO: 同步 policy history 顺序后，这里需要从最新帧中取 decoder target。
         obs_target = next_observations[:, 0:self.num_decoder]  # 取最新一帧obs
         
         vel_target.requires_grad = False
@@ -409,7 +414,7 @@ class ActorCriticDWAQ(nn.Module):
         }
 
     def export_to_onnx(self, path: str, filename: str = "Estnet_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将DWAQ策略导出为ONNX格式
+        """将VAE策略导出为ONNX格式
         
         Args:
             path: 保存目录的路径
@@ -423,15 +428,15 @@ class ActorCriticDWAQ(nn.Module):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
             
-        # 创建DWAQ专用的导出器
-        exporter = _DWAQOnnxPolicyExporter(self, normalizer, verbose)
+        # 创建VAE专用的导出器
+        exporter = _VAEOnnxPolicyExporter(self, normalizer, verbose)
         exporter.export(path, filename)
 
 
-class _DWAQOnnxPolicyExporter(torch.nn.Module):
-    """DWAQ策略的ONNX导出器"""
+class _VAEOnnxPolicyExporter(torch.nn.Module):
+    """VAE策略的ONNX导出器"""
 
-    def __init__(self, policy: ActorCriticDWAQ, normalizer=None, verbose=False):
+    def __init__(self, policy: ActorCriticVAE, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
         # 复制策略参数
@@ -455,6 +460,7 @@ class _DWAQOnnxPolicyExporter(torch.nn.Module):
         vel = self.encoder_vel_head(x)
         latent = self.encoder_latent_head(x)
         code = torch.cat((vel, latent), dim=-1)
+        # TODO: 同步 policy history 顺序后，export wrapper 也需要改为取最后一帧。
         now_obs = obs_noarmalized[:, 0:self.obs_one_frame_len]  # 获取当前观测值
         observations = torch.cat((code.detach(), now_obs), dim=-1)
         actions_mean = self.actor(observations)

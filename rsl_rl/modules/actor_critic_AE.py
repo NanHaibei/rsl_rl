@@ -15,7 +15,7 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
 import os
 
-class ActorCriticEstNet(nn.Module):
+class ActorCriticAE(nn.Module):
     is_recurrent: bool = False
 
     def __init__(
@@ -39,14 +39,14 @@ class ActorCriticEstNet(nn.Module):
     ) -> None:
         if kwargs:
             print(
-                "ActorCritic_EstNet.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
+                "ActorCritic_AE.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
             )
         super().__init__()
 
         # 传递回Env的额外信息
         self.extra_info = dict()
 
-        # Get the observation dimensions
+        # 计算policy和critic的输入维度
         self.obs_groups = obs_groups
         num_actor_obs = 0
         for obs_group in obs_groups["policy"]:
@@ -163,7 +163,7 @@ class ActorCriticEstNet(nn.Module):
         self.distribution = Normal(mean, std)
 
     def encoder_forward(self,obs_history):
-        """EstNet 前向推理
+        """AE 前向推理
         Args:
             obs_history (_type_): 历史观测值
 
@@ -245,7 +245,7 @@ class ActorCriticEstNet(nn.Module):
         
         Args:
             obs_batch: 当前观测批次数据
-            next_observations_batch: 下一时刻观测批次数据（EstNet不使用，但保持接口统一）
+            next_observations_batch: 下一时刻观测批次数据（AE不使用，但保持接口统一）
             encoder_optimizer: 编码器优化器
             max_grad_norm: 梯度裁剪的最大范数
             
@@ -311,12 +311,12 @@ class ActorCriticEstNet(nn.Module):
             "encoder_optimizer": encoder_optimizer
         }
 
-    def export_to_onnx(self, path: str, filename: str = "Estnet_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将EstNet策略导出为ONNX格式
+    def export_to_onnx(self, path: str, filename: str = "AE_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将AE策略导出为ONNX格式
         
         Args:
             path: 保存目录的路径
-            filename: 导出的ONNX文件名，默认为"Estnet_policy.onnx"
+            filename: 导出的ONNX文件名，默认为"AE_policy.onnx"
             normalizer: 归一化模块，如果为None则使用Identity
             verbose: 是否打印模型摘要，默认为False
         """
@@ -326,15 +326,15 @@ class ActorCriticEstNet(nn.Module):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
             
-        # 创建EstNet专用的导出器
-        exporter = _EstNetOnnxPolicyExporter(self, normalizer, verbose)
+        # 创建AE专用的导出器
+        exporter = _AEOnnxPolicyExporter(self, normalizer, verbose)
         exporter.export(path, filename)
 
 
-class _EstNetOnnxPolicyExporter(torch.nn.Module):
-    """EstNet策略的ONNX导出器"""
+class _AEOnnxPolicyExporter(torch.nn.Module):
+    """AE策略的ONNX导出器"""
 
-    def __init__(self, policy: ActorCriticEstNet, normalizer=None, verbose=False):
+    def __init__(self, policy: ActorCriticAE, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
         # 复制策略参数

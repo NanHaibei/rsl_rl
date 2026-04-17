@@ -14,8 +14,8 @@ from tensordict import TensorDict
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
-    ActorCriticEstNet,
-    ActorCriticDWAQ,
+    ActorCriticAE,
+    ActorCriticVAE,
     ActorCriticECMM
 )
 from rsl_rl.modules.rnd import RandomNetworkDistillation
@@ -29,8 +29,8 @@ from rsl_rl.utils import AMPLoader
 ActorCriticType = (
     ActorCritic
     | ActorCriticRecurrent
-    | ActorCriticEstNet
-    | ActorCriticDWAQ
+    | ActorCriticAE
+    | ActorCriticVAE
     | ActorCriticECMM
 )
 
@@ -120,8 +120,8 @@ class PPO:
         self.policy: ActorCriticType = policy
         self.policy.to(self.device)
         # 如果使用了EstNet、DWAQ
-        self.estnet = True if type(self.policy) == ActorCriticEstNet else False
-        self.dwaq = True if type(self.policy) == ActorCriticDWAQ else False
+        self.estnet = True if type(self.policy) == ActorCriticAE else False
+        self.dwaq = True if type(self.policy) == ActorCriticVAE else False
 
         # Create optimizer using policy's create_optimizers method
         optimizers_dict = self.policy.create_optimizers(learning_rate)

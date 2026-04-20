@@ -5,15 +5,17 @@
 
 from __future__ import annotations
 
+import copy
+import os
+from typing import Any, NoReturn
+
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch.distributions import Normal
-from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-import copy
-import os
+
 
 class ActorCriticAE(nn.Module):
     is_recurrent: bool = False
@@ -27,56 +29,72 @@ class ActorCriticAE(nn.Module):
         alg_cfg: dict | None = None,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
-        encoder_hidden_dims: tuple[int] | list[int] = [256, 256],
-        actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
-        critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+        encoder_hidden_dims: tuple[int] | list[int] = (256, 256),
+        decoder_hidden_dims: tuple[int] | list[int] = (256, 256),
+        actor_hidden_dims: tuple[int] | list[int] = (256, 256, 256),
+        critic_hidden_dims: tuple[int] | list[int] = (256, 256, 256),
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
         num_history_len: int = 5,
+        num_latent: int = 16,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
             print(
-                "ActorCritic_AE.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
+                "ActorCritic_AE.__init__ got unexpected arguments, which will be ignored: "
+                + str([key for key in kwargs])
             )
         super().__init__()
+
+        if num_latent < 0:
+            raise ValueError(f"num_latent must be non-negative. Received: {num_latent}.")
 
         # 传递回Env的额外信息
         self.extra_info = dict()
 
-        # 计算policy和critic的输入维度
         self.obs_groups = obs_groups
-        num_actor_obs = 0
-        for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
-            num_actor_obs += obs[obs_group].shape[-1]
-        num_critic_obs = 0
-        for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
-            num_critic_obs += obs[obs_group].shape[-1]
-
         self.state_dependent_std = state_dependent_std
-
-        # 记录历史信息长度
         self.num_history_len = num_history_len
-        # 单帧obs长度
-        self.obs_one_frame_len: int = int(num_actor_obs / num_history_len)
+        self.num_latent = num_latent
+
+        # Observation dimensions for the separate AE data paths.
+        num_actor_obs = self._sum_obs_dims(obs, obs_groups["policy"])
+        num_history_obs = self._sum_obs_dims(obs, obs_groups["policy_history"])
+        num_critic_obs = self._sum_obs_dims(obs, obs_groups["critic"])
+        num_critic_vel_obs = self._sum_obs_dims(obs, obs_groups["critic_vel"]) if "critic_vel" in obs_groups else 3
+        num_critic_prop_obs = (
+            self._sum_obs_dims(obs, obs_groups["critic_prop"]) if "critic_prop" in obs_groups else 0
+        )
+
+        if num_critic_vel_obs < 3:
+            raise ValueError(f"critic_vel observation must contain at least 3 values. Received: {num_critic_vel_obs}.")
+        if self.num_latent > 0 and num_critic_prop_obs <= 0:
+            raise ValueError("critic_prop observation group is required when num_latent > 0.")
+
+        self.num_actor_obs = num_actor_obs
+        self.num_history_obs = num_history_obs
+        self.num_critic_obs = num_critic_obs
+        self.num_critic_prop_obs = num_critic_prop_obs
+
 
         # Actor
+        actor_input_dim = num_actor_obs + 3 + self.num_latent
         if self.state_dependent_std:
-            self.actor = MLP(self.obs_one_frame_len + 3, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = MLP(actor_input_dim, [2, num_actions], actor_hidden_dims, activation)
         else:
-            self.actor = MLP(self.obs_one_frame_len + 3, num_actions, actor_hidden_dims, activation)
+            self.actor = MLP(actor_input_dim, num_actions, actor_hidden_dims, activation)
         print(f"Actor MLP: {self.actor}")
 
-        # 用于归一化历史本体信息
+        # Actor/current proprioception normalization.
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
             self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
+            self.history_obs_normalizer = EmpiricalNormalization(num_history_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
+            self.history_obs_normalizer = torch.nn.Identity()
 
         # Critic
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
@@ -89,9 +107,17 @@ class ActorCriticAE(nn.Module):
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
-        # Encoder
-        self.encoder = MLP(num_actor_obs, 3, encoder_hidden_dims, activation)
+        # Encoder: proprioceptive history -> [base linear velocity, optional latent].
+        self.encoder = MLP(num_history_obs, 3 + self.num_latent, encoder_hidden_dims, activation)
         print(f"Encoder MLP: {self.encoder}")
+
+        # Decoder: latent -> next critic_prop. Disabled when latent dimension is 0.
+        if self.num_latent > 0:
+            self.decoder = MLP(self.num_latent, num_critic_prop_obs, decoder_hidden_dims, activation)
+            print(f"Decoder MLP: {self.decoder}")
+        else:
+            self.decoder = None
+            print("Decoder MLP: disabled because num_latent=0")
 
         # Action noise
         self.noise_std_type = noise_std_type
@@ -138,7 +164,15 @@ class ActorCriticAE(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _update_distribution(self, obs: TensorDict) -> None:
+    @staticmethod
+    def _sum_obs_dims(obs: TensorDict, obs_group_names: list[str]) -> int:
+        num_obs = 0
+        for obs_group in obs_group_names:
+            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            num_obs += obs[obs_group].shape[-1]
+        return num_obs
+
+    def _update_distribution(self, obs: torch.Tensor) -> None:
         if self.state_dependent_std:
             # Compute mean and standard deviation
             mean_and_std = self.actor(obs)
@@ -162,34 +196,56 @@ class ActorCriticAE(nn.Module):
         # Create distribution
         self.distribution = Normal(mean, std)
 
-    def encoder_forward(self,obs_history):
-        """AE 前向推理
-        Args:
-            obs_history (_type_): 历史观测值
+    def encoder_forward(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the AE encoder and split velocity from the optional latent."""
+        code = self.encoder(obs_history)
+        est_vel = code[:, :3]
+        latent = code[:, 3:]
+        return est_vel, latent
 
-        """
-        x = self.encoder(obs_history)
-        return x
+    def decoder_forward(self, latent: torch.Tensor) -> torch.Tensor | None:
+        if self.decoder is None:
+            return None
+        return self.decoder(latent)
+
+    def _make_actor_input(
+        self, actor_obs: torch.Tensor, est_vel: torch.Tensor, latent: torch.Tensor
+    ) -> torch.Tensor:
+        if self.num_latent > 0:
+            return torch.cat((est_vel, latent, actor_obs), dim=-1)
+        return torch.cat((est_vel, actor_obs), dim=-1)
+
+    def _get_normalized_actor_inputs(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        history_obs = self.history_obs_normalizer(self.get_history_obs(obs))
+        return actor_obs, history_obs
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
-        obs = self.get_actor_obs(obs)
-        obs = self.actor_obs_normalizer(obs)
-        est_vel = self.encoder_forward(obs)
-        now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((est_vel.detach(),now_obs),dim=-1)
+        actor_obs, history_obs = self._get_normalized_actor_inputs(obs)
+        est_vel, latent = self.encoder_forward(history_obs)
+        observation = self._make_actor_input(actor_obs, est_vel.detach(), latent.detach())
         self._update_distribution(observation)
-        # 记录速度估计值
-        self.extra_info["est_vel"] = est_vel
+
+        self.extra_info = {"est_vel": est_vel.detach()}
+        if self.num_latent > 0:
+            self.extra_info["latent"] = latent.detach()
+            critic_prop_predict = self.decoder_forward(latent)
+            if critic_prop_predict is not None:
+                self.extra_info["critic_prop_predict"] = critic_prop_predict.detach()
         return self.distribution.sample(), self.extra_info
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
-        obs = self.get_actor_obs(obs)
-        obs = self.actor_obs_normalizer(obs)
-        est_vel = self.encoder_forward(obs)
-        now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((est_vel.detach(),now_obs),dim=-1)
-        # 记录速度估计值
-        self.extra_info["est_vel"] = est_vel
+        actor_obs, history_obs = self._get_normalized_actor_inputs(obs)
+        est_vel, latent = self.encoder_forward(history_obs)
+        observation = self._make_actor_input(actor_obs, est_vel.detach(), latent.detach())
+
+        self.extra_info = {"est_vel": est_vel.detach()}
+        if self.num_latent > 0:
+            self.extra_info["latent"] = latent.detach()
+            critic_prop_predict = self.decoder_forward(latent)
+            if critic_prop_predict is not None:
+                self.extra_info["critic_prop_predict"] = critic_prop_predict.detach()
+
         if self.state_dependent_std:
             return self.actor(observation)[..., 0, :], self.extra_info
         else:
@@ -204,8 +260,25 @@ class ActorCriticAE(nn.Module):
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]
         return torch.cat(obs_list, dim=-1)
 
+    def get_history_obs(self, obs: TensorDict) -> torch.Tensor:
+        history_groups = self.obs_groups.get("policy_history", self.obs_groups["policy"])
+        obs_list = [obs[obs_group] for obs_group in history_groups]
+        return torch.cat(obs_list, dim=-1)
+
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic"]]
+        return torch.cat(obs_list, dim=-1)
+
+    def get_critic_vel_obs(self, obs: TensorDict) -> torch.Tensor:
+        if "critic_vel" in self.obs_groups:
+            obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic_vel"]]
+            return torch.cat(obs_list, dim=-1)
+        return self.get_critic_obs(obs)[:, :3]
+
+    def get_critic_prop_obs(self, obs: TensorDict) -> torch.Tensor:
+        if "critic_prop" not in self.obs_groups:
+            raise ValueError("critic_prop observation group is required for AE decoder training.")
+        obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic_prop"]]
         return torch.cat(obs_list, dim=-1)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -213,8 +286,8 @@ class ActorCriticAE(nn.Module):
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:
-            actor_obs = self.get_actor_obs(obs)
-            self.actor_obs_normalizer.update(actor_obs)
+            self.actor_obs_normalizer.update(self.get_actor_obs(obs))
+            self.history_obs_normalizer.update(self.get_history_obs(obs))
         if self.critic_obs_normalization:
             critic_obs = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(critic_obs)
@@ -235,135 +308,136 @@ class ActorCriticAE(nn.Module):
         return True
 
     def update_encoder(
-        self, 
+        self,
         obs_batch: TensorDict,
         next_observations_batch: TensorDict,
-        encoder_optimizer: torch.optim.Optimizer, 
-        max_grad_norm: float
+        encoder_optimizer: torch.optim.Optimizer,
+        max_grad_norm: float,
     ) -> dict[str, float]:
-        """计算编码器损失并更新参数
-        
-        Args:
-            obs_batch: 当前观测批次数据
-            next_observations_batch: 下一时刻观测批次数据（AE不使用，但保持接口统一）
-            encoder_optimizer: 编码器优化器
-            max_grad_norm: 梯度裁剪的最大范数
-            
-        Returns:
-            损失字典，包含各项损失值
-        """
-        # 获取并归一化policy观测
-        policy_obs = self.get_actor_obs(obs_batch)
-        policy_obs = self.actor_obs_normalizer(policy_obs)
-        
-        # 前向传播得到速度估计
-        vel_est = self.encoder_forward(policy_obs)
-        
-        # 获取并归一化critic观测，提取真实速度
-        critic_obs = self.get_critic_obs(obs_batch)
-        critic_obs = self.critic_obs_normalizer(critic_obs)
-        vel_target = critic_obs[:, 0:3]  # 真实速度作为目标
-        vel_target.requires_grad = False
-        
-        # 计算MSE损失（放大1000倍以获得更明显的梯度）
-        vel_MSE = nn.MSELoss()(vel_est, vel_target)
-        
-        # 反向传播
-        encoder_optimizer.zero_grad()
-        vel_MSE.backward(retain_graph=True)
-        
-        # 梯度裁剪
-        encoder_params = [p for group in encoder_optimizer.param_groups for p in group['params']]
-        nn.utils.clip_grad_norm_(encoder_params, max_grad_norm)
-        
-        # 更新参数
-        encoder_optimizer.step()
-        
-        # 返回统一格式的损失字典
-        return {
-            "vel_loss": vel_MSE.item(),
-            "total_loss": vel_MSE.item(),
+        """Update the encoder and optional decoder from rollout observations."""
+        history_obs = self.history_obs_normalizer(self.get_history_obs(obs_batch))
+        est_vel, latent = self.encoder_forward(history_obs)
+
+        vel_target = self.get_critic_vel_obs(obs_batch)[:, :3].detach()
+        vel_loss = nn.MSELoss()(est_vel, vel_target)
+        total_loss = vel_loss
+
+        loss_dict = {
+            "vel_loss": vel_loss.item(),
         }
+
+        if self.num_latent > 0:
+            critic_prop_predict = self.decoder_forward(latent)
+            critic_prop_target = self.get_critic_prop_obs(next_observations_batch).detach()
+            prop_loss = nn.MSELoss()(critic_prop_predict, critic_prop_target)
+            total_loss = total_loss + prop_loss
+            loss_dict["prop_loss"] = prop_loss.item()
+
+        encoder_optimizer.zero_grad()
+        total_loss.backward()
+
+        encoder_params = [p for group in encoder_optimizer.param_groups for p in group["params"]]
+        nn.utils.clip_grad_norm_(encoder_params, max_grad_norm)
+
+        encoder_optimizer.step()
+        encoder_optimizer.zero_grad(set_to_none=True)
+
+        loss_dict["total_loss"] = total_loss.item()
+        return loss_dict
 
     def create_optimizers(self, learning_rate: float) -> dict[str, torch.optim.Optimizer]:
-        """创建优化器
-        
-        Args:
-            learning_rate: 学习率
-            
-        Returns:
-            优化器字典，包含主要的优化器和编码器优化器
-        """
+        """创建优化器"""
         import torch.optim as optim
-        
-        optimizer = optim.Adam([
-            {'params': self.actor.parameters()},
-            {'params': self.critic.parameters()},
-            {'params': [self.std] if self.noise_std_type == "scalar" else [self.log_std]},
-        ], lr=learning_rate)
-        
-        encoder_optimizer = optim.Adam([
-            {'params': self.encoder.parameters()},
-        ], lr=learning_rate)
-        
+
+        optimizer_params = [
+            {"params": self.actor.parameters()},
+            {"params": self.critic.parameters()},
+        ]
+        if not self.state_dependent_std:
+            optimizer_params.append(
+                {"params": [self.std] if self.noise_std_type == "scalar" else [self.log_std]}
+            )
+        optimizer = optim.Adam(optimizer_params, lr=learning_rate)
+
+        encoder_params = [{"params": self.encoder.parameters()}]
+        if self.decoder is not None:
+            encoder_params.append({"params": self.decoder.parameters()})
+        encoder_optimizer = optim.Adam(encoder_params, lr=learning_rate)
+
         return {
             "optimizer": optimizer,
-            "encoder_optimizer": encoder_optimizer
+            "encoder_optimizer": encoder_optimizer,
         }
 
-    def export_to_onnx(self, path: str, filename: str = "AE_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将AE策略导出为ONNX格式
-        
-        Args:
-            path: 保存目录的路径
-            filename: 导出的ONNX文件名，默认为"AE_policy.onnx"
-            normalizer: 归一化模块，如果为None则使用Identity
-            verbose: 是否打印模型摘要，默认为False
-        """
-        import copy
-        import os
-        
+    def export_to_onnx(
+        self,
+        path: str,
+        filename: str = "AE_policy.onnx",
+        normalizer: torch.nn.Module | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """将AE策略导出为ONNX格式"""
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
-            
-        # 创建AE专用的导出器
+
         exporter = _AEOnnxPolicyExporter(self, normalizer, verbose)
         exporter.export(path, filename)
 
 
 class _AEOnnxPolicyExporter(torch.nn.Module):
-    """AE策略的ONNX导出器"""
+    """AE策略的ONNX导出器。
+
+    The ONNX input is a concatenation of [policy_new, policy_history].
+    """
 
     def __init__(self, policy: ActorCriticAE, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
-        # 复制策略参数
-        if hasattr(policy, "actor"):
-            self.actor = copy.deepcopy(policy.actor)
-
-        # 复制编码器
+        self.actor = copy.deepcopy(policy.actor)
         self.encoder = copy.deepcopy(policy.encoder)
-        # 一帧观测的长度
-        self.obs_one_frame_len = policy.obs_one_frame_len
+        self.state_dependent_std = policy.state_dependent_std
+        self.num_actor_obs = policy.num_actor_obs
+        self.num_history_obs = policy.num_history_obs
+        self.num_latent = policy.num_latent
 
-        if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
+        if normalizer is not None:
+            self.actor_obs_normalizer = copy.deepcopy(normalizer)
         else:
-            self.normalizer = torch.nn.Identity()
+            self.actor_obs_normalizer = copy.deepcopy(policy.actor_obs_normalizer)
+        self.history_obs_normalizer = copy.deepcopy(policy.history_obs_normalizer)
 
-    def forward(self, x):
-        obs = self.normalizer(x)
-        est_vel = self.encoder(obs)
-        new_obs = obs[:, 0:self.obs_one_frame_len]
-        obs_actor = torch.cat((est_vel.detach(), new_obs), dim=-1)
-        actions_mean = self.actor(obs_actor)
+    def forward(self, x: torch.Tensor):
+        actor_obs = x[:, : self.num_actor_obs]
+        history_obs = x[:, self.num_actor_obs : self.num_actor_obs + self.num_history_obs]
+
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        history_obs = self.history_obs_normalizer(history_obs)
+
+        code = self.encoder(history_obs)
+        est_vel = code[:, :3]
+        latent = code[:, 3:]
+
+        if self.num_latent > 0:
+            actor_input = torch.cat((est_vel.detach(), latent.detach(), actor_obs), dim=-1)
+        else:
+            actor_input = torch.cat((est_vel.detach(), actor_obs), dim=-1)
+
+        actions_mean = self.actor(actor_input)
+        if self.state_dependent_std:
+            actions_mean = actions_mean[..., 0, :]
+
+        if self.num_latent > 0:
+            return actions_mean, est_vel, latent
         return actions_mean, est_vel
 
     def export(self, path, filename):
         self.to("cpu")
         self.eval()
         opset_version = 18
-        obs = torch.zeros(1, self.encoder[0].in_features)
+        obs = torch.zeros(1, self.num_actor_obs + self.num_history_obs)
+        output_names = ["actions", "est_vel"]
+        if self.num_latent > 0:
+            output_names.append("latent")
         torch.onnx.export(
             self,
             obs,
@@ -372,6 +446,6 @@ class _AEOnnxPolicyExporter(torch.nn.Module):
             opset_version=opset_version,
             verbose=self.verbose,
             input_names=["obs"],
-            output_names=["actions","est_vel"],
+            output_names=output_names,
             dynamic_axes={},
         )

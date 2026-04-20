@@ -37,7 +37,6 @@ class ActorCriticAE(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
-        num_history_len: int = 5,
         num_latent: int = 16,
         **kwargs: dict[str, Any],
     ) -> None:
@@ -56,7 +55,6 @@ class ActorCriticAE(nn.Module):
 
         self.obs_groups = obs_groups
         self.state_dependent_std = state_dependent_std
-        self.num_history_len = num_history_len
         self.num_latent = num_latent
 
         # Observation dimensions for the separate AE data paths.

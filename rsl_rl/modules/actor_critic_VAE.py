@@ -5,15 +5,17 @@
 
 from __future__ import annotations
 
+import copy
+import os
+from typing import Any, NoReturn
+
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torch.distributions import Normal
-from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
-import copy
-import os
+
 
 class ActorCriticVAE(nn.Module):
     is_recurrent: bool = False
@@ -27,16 +29,16 @@ class ActorCriticVAE(nn.Module):
         alg_cfg: dict | None = None,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
-        encoder_hidden_dims: tuple[int] | list[int] = [256, 256],
-        decoder_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
-        actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
-        critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
+        encoder_hidden_dims: tuple[int] | list[int] = (256, 256),
+        decoder_hidden_dims: tuple[int] | list[int] = (256, 256, 256),
+        actor_hidden_dims: tuple[int] | list[int] = (256, 256, 256),
+        critic_hidden_dims: tuple[int] | list[int] = (256, 256, 256),
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
         num_decode: int = 30,
-        num_latent: int = 19,
+        num_latent: int = 16,
         num_history_len: int = 5,
         VAE_beta: float = 1.0,
         use_adaboot: bool = False,
@@ -44,78 +46,96 @@ class ActorCriticVAE(nn.Module):
     ) -> None:
         if kwargs:
             print(
-                "ActorCritic_VAE.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs])
+                "ActorCritic_VAE.__init__ got unexpected arguments, which will be ignored: "
+                + str([key for key in kwargs])
             )
         super().__init__()
 
-        # 传递回Env的额外信息
+        if num_latent < 0:
+            raise ValueError(f"num_latent must be non-negative. Received: {num_latent}.")
+        if len(encoder_hidden_dims) == 0:
+            raise ValueError("encoder_hidden_dims must contain at least one hidden dimension.")
+
         self.extra_info = dict()
-
-        # 记录beta值
         self.beta = VAE_beta
-
-        # Get the observation dimensions
         self.obs_groups = obs_groups
-        num_actor_obs = 0
-        for obs_group in obs_groups["policy"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
-            num_actor_obs += obs[obs_group].shape[-1]
-        num_critic_obs = 0
-        for obs_group in obs_groups["critic"]:
-            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
-            num_critic_obs += obs[obs_group].shape[-1]
-
         self.state_dependent_std = state_dependent_std
-
-        # 记录历史信息长度
-        self.num_history_len = num_history_len
-        # 单帧obs长度
-        self.obs_one_frame_len: int = int(num_actor_obs / num_history_len)
-        # 记录decoder输出的维度
+        self.num_latent = num_latent
+        # Kept for config/checkpoint compatibility. The new VAE infers dimensions from observation groups.
         self.num_decoder = num_decode
-        # 是否使用adaboot
+        self.num_history_len = num_history_len
         self.use_adaboot = use_adaboot
 
+        # Observation dimensions for the separate VAE data paths.
+        num_actor_obs = self._sum_obs_dims(obs, obs_groups["policy"])
+        num_history_obs = self._sum_obs_dims(obs, obs_groups["policy_history"])
+        num_critic_obs = self._sum_obs_dims(obs, obs_groups["critic"])
+        num_critic_vel_obs = self._sum_obs_dims(obs, obs_groups["critic_vel"]) if "critic_vel" in obs_groups else 3
+        num_critic_prop_obs = (
+            self._sum_obs_dims(obs, obs_groups["critic_prop"]) if "critic_prop" in obs_groups else 0
+        )
+
+        if num_critic_vel_obs < 3:
+            raise ValueError(f"critic_vel observation must contain at least 3 values. Received: {num_critic_vel_obs}.")
+        if self.num_latent > 0 and num_critic_prop_obs <= 0:
+            raise ValueError("critic_prop observation group is required when num_latent > 0.")
+
+        self.num_actor_obs = num_actor_obs
+        self.num_history_obs = num_history_obs
+        self.num_critic_obs = num_critic_obs
+        self.num_critic_prop_obs = num_critic_prop_obs
+        self.obs_one_frame_len = num_actor_obs
+
         # Actor
+        actor_input_dim = num_actor_obs + 3 + self.num_latent
         if self.state_dependent_std:
-            self.actor = MLP(self.obs_one_frame_len + num_latent, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = MLP(actor_input_dim, [2, num_actions], actor_hidden_dims, activation)
         else:
-            self.actor = MLP(self.obs_one_frame_len + num_latent, num_actions, actor_hidden_dims, activation)
+            self.actor = MLP(actor_input_dim, num_actions, actor_hidden_dims, activation)
         print(f"Actor MLP: {self.actor}")
 
-        # 用于归一化历史本体信息
+        # Actor/current proprioception normalization.
         self.actor_obs_normalization = actor_obs_normalization
         if actor_obs_normalization:
             self.actor_obs_normalizer = EmpiricalNormalization(num_actor_obs)
+            self.history_obs_normalizer = EmpiricalNormalization(num_history_obs)
         else:
             self.actor_obs_normalizer = torch.nn.Identity()
+            self.history_obs_normalizer = torch.nn.Identity()
 
         # Critic
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
-        # Critic observation normalization
+        # Critic observation normalization.
         self.critic_obs_normalization = critic_obs_normalization
         if critic_obs_normalization:
             self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
-        # Encoder
-        self.encoder_backbone = MLP(num_actor_obs, encoder_hidden_dims[-1], encoder_hidden_dims[:-1], activation, last_activation="elu")
-        self.encoder_latent_mean = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的均值
-        self.encoder_latent_logvar = nn.Linear(encoder_hidden_dims[-1],num_latent-3) # 输出隐向量的logvar
-        self.encoder_vel_mean = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的均值
-        self.encoder_vel_logvar = nn.Linear(encoder_hidden_dims[-1],3) # 输出速度的logvar
+        # Encoder: proprioceptive history -> deterministic velocity + variational latent.
+        encoder_feature_dim = encoder_hidden_dims[-1]
+        self.encoder_backbone = MLP(
+            num_history_obs,
+            encoder_feature_dim,
+            encoder_hidden_dims[:-1],
+            activation,
+            last_activation=activation,
+        )
+        self.encoder_vel_mean = nn.Linear(encoder_feature_dim, 3)
         print(f"Encoder backbone MLP: {self.encoder_backbone}")
-        print(f"Encoder latent mean: {self.encoder_latent_mean}")
-        print(f"Encoder latent logvar: {self.encoder_latent_logvar}")
         print(f"Encoder velocity mean: {self.encoder_vel_mean}")
-        print(f"Encoder velocity logvar: {self.encoder_vel_logvar}")
 
-        # Decoder
-        self.decoder = MLP(num_latent, num_decode, decoder_hidden_dims, activation)
-        print(f"Decoder MLP: {self.decoder}")
+        if self.num_latent > 0:
+            self.encoder_latent_mean = nn.Linear(encoder_feature_dim, self.num_latent)
+            self.encoder_latent_logvar = nn.Linear(encoder_feature_dim, self.num_latent)
+            self.decoder = MLP(self.num_latent, num_critic_prop_obs, decoder_hidden_dims, activation)
+            print(f"Encoder latent mean: {self.encoder_latent_mean}")
+            print(f"Encoder latent logvar: {self.encoder_latent_logvar}")
+            print(f"Decoder MLP: {self.decoder}")
+        else:
+            print("Encoder latent heads and decoder disabled because num_latent=0")
 
         # Action noise
         self.noise_std_type = noise_std_type
@@ -162,7 +182,15 @@ class ActorCriticVAE(nn.Module):
     def entropy(self) -> torch.Tensor:
         return self.distribution.entropy().sum(dim=-1)
 
-    def _update_distribution(self, obs: TensorDict) -> None:
+    @staticmethod
+    def _sum_obs_dims(obs: TensorDict, obs_group_names: list[str]) -> int:
+        num_obs = 0
+        for obs_group in obs_group_names:
+            assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
+            num_obs += obs[obs_group].shape[-1]
+        return num_obs
+
+    def _update_distribution(self, obs: torch.Tensor) -> None:
         if self.state_dependent_std:
             # Compute mean and standard deviation
             mean_and_std = self.actor(obs)
@@ -186,93 +214,76 @@ class ActorCriticVAE(nn.Module):
         # Create distribution
         self.distribution = Normal(mean, std)
 
-    def reparameterise(self,mean,logvar):
-        """重参数化
+    def reparameterise(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Sample from N(mean, exp(logvar)) using the reparameterization trick."""
+        std = torch.exp(logvar * 0.5)
+        return mean + std * torch.randn_like(std)
 
-        Args:
-            mean (_type_): 均值
-            logvar (_type_): 对数方差
-
-        Returns:
-            _type_: 隐向量
-        """
-        std = torch.exp(logvar*0.5) # 得到标准差
-        code_temp = torch.randn_like(std)
-        code = mean + std * code_temp
-        return code
-    
-    def encoder_forward(self,obs_history):
-        """CENet 前向推理
-
-        Args:
-            obs_history (_type_): 历史观测值
+    def encoder_forward(
+        self, obs_history: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the VAE encoder.
 
         Returns:
-            _type_: _description_
+            est_vel, latent_mean, latent_logvar, latent_sample.
         """
-        # 编码器网络前向推理
         x = self.encoder_backbone(obs_history)
-        latent_mean = self.encoder_latent_mean(x) # 得到隐向量的均值
-        latent_logvar = self.encoder_latent_logvar(x) # 得到隐向量的对数方差
-        vel_mean = self.encoder_vel_mean(x) # 得到速度的均值
-        vel_logvar = self.encoder_vel_logvar(x) # 得到速度的对数方差
-        # 对数方差限制在一定范围内，避免过大
-        latent_logvar = torch.clip(latent_logvar,min=-10,max=10)
-        vel_logvar = torch.clip(vel_logvar,min=-10,max=10)
-        # 采样隐向量和速度
-        latent_sample = self.reparameterise(latent_mean,latent_logvar)
-        vel_sample = self.reparameterise(vel_mean,vel_logvar)
-        # 将速度和隐向量拼接起来
-        code = torch.cat((vel_sample,latent_sample),dim=-1)
-        # 解码得到下一时刻观测值
-        decode = self.decoder(code)
+        est_vel = self.encoder_vel_mean(x)
 
-        return code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar
+        if self.num_latent > 0:
+            latent_mean = self.encoder_latent_mean(x)
+            latent_logvar = torch.clip(self.encoder_latent_logvar(x), min=-10, max=10)
+            latent_sample = self.reparameterise(latent_mean, latent_logvar)
+        else:
+            latent_mean = est_vel.new_empty(est_vel.shape[0], 0)
+            latent_logvar = est_vel.new_empty(est_vel.shape[0], 0)
+            latent_sample = est_vel.new_empty(est_vel.shape[0], 0)
+
+        return est_vel, latent_mean, latent_logvar, latent_sample
+
+    def decoder_forward(self, latent: torch.Tensor) -> torch.Tensor | None:
+        if self.num_latent == 0 or not hasattr(self, "decoder"):
+            return None
+        return self.decoder(latent)
+
+    def _make_actor_input(
+        self, actor_obs: torch.Tensor, est_vel: torch.Tensor, latent_mean: torch.Tensor
+    ) -> torch.Tensor:
+        if self.num_latent > 0:
+            return torch.cat((est_vel, latent_mean, actor_obs), dim=-1)
+        return torch.cat((est_vel, actor_obs), dim=-1)
+
+    def _get_normalized_actor_inputs(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        history_obs = self.history_obs_normalizer(self.get_history_obs(obs))
+        return actor_obs, history_obs
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
-        actor_obs = self.get_actor_obs(obs)
-        actor_obs = self.actor_obs_normalizer(actor_obs)
-        code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(actor_obs)
-        # TODO: 如果 policy history 改为 IsaacLab 内置 history，CircularBuffer 展平顺序是旧帧在前、最新帧在最后。
-        # 当前这里仍按“最新帧在最前面”的假设取 actor_obs[:, 0:self.obs_one_frame_len]。
-        # 后续需要同步改为取最后一帧，并一起调整 decoder target 和 export wrapper 的切片。
-        now_obs = actor_obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        
-        # 根据条件决定是否使用adaboot
-        reward = kwargs.get("rewards", None)
-        if self.use_adaboot and reward is not None:
-            # 计算adaboot概率
-            CV_R = torch.std(reward) / (torch.mean(reward) + 1e-8)
-            p_boot = 1 - torch.tanh(CV_R)
-            # 获取真实线速度（使用原始obs）
-            critic_obs = self.get_critic_obs(obs)
-            critic_obs = self.critic_obs_normalizer(critic_obs)
-            real_lin_vel = critic_obs[:, 0:3]  # 取前3维作为真实线速度
-            # 按概率选择使用估计速度还是真实速度
-            use_estimated = torch.rand(1, device=vel_sample.device).item() < p_boot
-            selected_vel = vel_sample if use_estimated else real_lin_vel
-            observation = torch.cat((selected_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
-            # observation = torch.cat((real_lin_vel.detach(), latent_sample.detach(), now_obs), dim=-1)
-        else:
-            # 不使用adaboot或在更新阶段，直接使用code
-            observation = torch.cat((code.detach(), now_obs), dim=-1)
-        
+        actor_obs, history_obs = self._get_normalized_actor_inputs(obs)
+        est_vel, latent_mean, _, _ = self.encoder_forward(history_obs)
+        observation = self._make_actor_input(actor_obs, est_vel.detach(), latent_mean.detach())
         self._update_distribution(observation)
-        # 记录速度估计值
-        self.extra_info["est_vel"] = vel_mean 
-        self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decoder] + 1e-2) + self.actor_obs_normalizer.mean[:self.num_decoder]  # 返回反归一化后的预测观测值
+
+        self.extra_info = {"est_vel": est_vel.detach()}
+        if self.num_latent > 0:
+            self.extra_info["latent_mean"] = latent_mean.detach()
+            critic_prop_predict = self.decoder_forward(latent_mean)
+            if critic_prop_predict is not None:
+                self.extra_info["critic_prop_predict"] = critic_prop_predict.detach()
         return self.distribution.sample(), self.extra_info
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
-        obs = self.get_actor_obs(obs)
-        obs = self.actor_obs_normalizer(obs)
-        code,vel_sample,latent_sample,decode,vel_mean,vel_logvar,latent_mean,latent_logvar = self.encoder_forward(obs)
-        # TODO: 同步上面的 policy history 顺序后，这里也需要改为取最后一帧。
-        now_obs = obs[:, 0:self.obs_one_frame_len]  # 取当前观测值部分
-        observation = torch.cat((vel_mean.detach(), latent_mean.detach(), now_obs),dim=-1)
-        # 记录速度估计值
-        self.extra_info["est_vel"] = vel_mean 
-        self.extra_info["obs_predict"] = decode * (self.actor_obs_normalizer.std[:self.num_decoder] + 1e-2) + self.actor_obs_normalizer.mean[:self.num_decoder]  # 返回反归一化后的预测观测值
+        actor_obs, history_obs = self._get_normalized_actor_inputs(obs)
+        est_vel, latent_mean, _, _ = self.encoder_forward(history_obs)
+        observation = self._make_actor_input(actor_obs, est_vel.detach(), latent_mean.detach())
+
+        self.extra_info = {"est_vel": est_vel.detach()}
+        if self.num_latent > 0:
+            self.extra_info["latent_mean"] = latent_mean.detach()
+            critic_prop_predict = self.decoder_forward(latent_mean)
+            if critic_prop_predict is not None:
+                self.extra_info["critic_prop_predict"] = critic_prop_predict.detach()
+
         if self.state_dependent_std:
             return self.actor(observation)[..., 0, :], self.extra_info
         else:
@@ -287,8 +298,25 @@ class ActorCriticVAE(nn.Module):
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["policy"]]
         return torch.cat(obs_list, dim=-1)
 
+    def get_history_obs(self, obs: TensorDict) -> torch.Tensor:
+        history_groups = self.obs_groups.get("policy_history", self.obs_groups["policy"])
+        obs_list = [obs[obs_group] for obs_group in history_groups]
+        return torch.cat(obs_list, dim=-1)
+
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic"]]
+        return torch.cat(obs_list, dim=-1)
+
+    def get_critic_vel_obs(self, obs: TensorDict) -> torch.Tensor:
+        if "critic_vel" in self.obs_groups:
+            obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic_vel"]]
+            return torch.cat(obs_list, dim=-1)
+        return self.get_critic_obs(obs)[:, :3]
+
+    def get_critic_prop_obs(self, obs: TensorDict) -> torch.Tensor:
+        if "critic_prop" not in self.obs_groups:
+            raise ValueError("critic_prop observation group is required for VAE decoder training.")
+        obs_list = [obs[obs_group] for obs_group in self.obs_groups["critic_prop"]]
         return torch.cat(obs_list, dim=-1)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -296,8 +324,8 @@ class ActorCriticVAE(nn.Module):
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:
-            actor_obs = self.get_actor_obs(obs)
-            self.actor_obs_normalizer.update(actor_obs)
+            self.actor_obs_normalizer.update(self.get_actor_obs(obs))
+            self.history_obs_normalizer.update(self.get_history_obs(obs))
         if self.critic_obs_normalization:
             critic_obs = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(critic_obs)
@@ -318,159 +346,153 @@ class ActorCriticVAE(nn.Module):
         return True
 
     def update_encoder(
-        self, 
-        obs_batch: TensorDict, 
+        self,
+        obs_batch: TensorDict,
         next_observations_batch: TensorDict,
-        encoder_optimizer: torch.optim.Optimizer, 
-        max_grad_norm: float
+        encoder_optimizer: torch.optim.Optimizer,
+        max_grad_norm: float,
     ) -> dict[str, float]:
-        """计算VAE编码器损失并更新参数
-        
-        Args:
-            obs_batch: 当前观测批次数据
-            next_observations_batch: 下一时刻观测批次数据
-            encoder_optimizer: 编码器优化器
-            max_grad_norm: 梯度裁剪的最大范数
-            
-        Returns:
-            损失字典，包含各项损失值
-        """
-        # 获取并归一化policy观测
-        policy_obs = self.get_actor_obs(obs_batch)
-        policy_obs = self.actor_obs_normalizer(policy_obs)
-        
-        # 前向传播得到编码器输出
-        code, vel_sample, latent_sample, decode, vel_mean, vel_logvar, latent_mean, latent_logvar = self.encoder_forward(policy_obs)
-        
-        # 获取并归一化critic观测，提取真实速度
-        critic_obs = self.get_critic_obs(obs_batch)
-        critic_obs = self.critic_obs_normalizer(critic_obs)
-        vel_target = critic_obs[:, 0:3]  # 真实速度作为目标
-        
-        # 获取下一时刻观测，提取目标观测
-        next_observations = self.get_actor_obs(next_observations_batch) # TODO：应该使用critic的无噪声观测值才对
-        next_observations = self.actor_obs_normalizer(next_observations)
-        # TODO: 同步 policy history 顺序后，这里需要从最新帧中取 decoder target。
-        obs_target = next_observations[:, 0:self.num_decoder]  # 取最新一帧obs
-        
-        vel_target.requires_grad = False
-        obs_target.requires_grad = False
-        
-        # DreamWaQ损失 = 速度重建损失 + obs重建损失 + KL散度损失
-        vel_MSE = nn.MSELoss()(vel_sample, vel_target) * 100.0
-        obs_MSE = nn.MSELoss()(decode, obs_target)
-        # KL散度损失：按批次平均
-        dkl_loss = -0.5 * torch.mean(torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1))
-        autoenc_loss = vel_MSE + obs_MSE + self.beta * dkl_loss
-        
-        # 反向传播
-        encoder_optimizer.zero_grad()
-        autoenc_loss.backward(retain_graph=True)
-        
-        # 梯度裁剪
-        encoder_params = [p for group in encoder_optimizer.param_groups for p in group['params']]
-        nn.utils.clip_grad_norm_(encoder_params, max_grad_norm)
-        
-        # 更新参数
-        encoder_optimizer.step()
-        
-        # 返回统一格式的损失字典
-        return {
-            "vel_loss": vel_MSE.item(),
-            "obs_loss": obs_MSE.item(),
-            "dkl_loss": dkl_loss.item(),
-            "total_loss": autoenc_loss.item(),
+        """Update the VAE encoder and optional decoder from rollout observations."""
+        history_obs = self.history_obs_normalizer(self.get_history_obs(obs_batch))
+        est_vel, latent_mean, latent_logvar, latent_sample = self.encoder_forward(history_obs)
+
+        vel_target = self.get_critic_vel_obs(obs_batch)[:, :3].detach()
+        vel_loss = nn.MSELoss()(est_vel, vel_target)
+        total_loss = vel_loss
+
+        loss_dict = {
+            "vel_loss": vel_loss.item(),
         }
+
+        if self.num_latent > 0:
+            critic_prop_predict = self.decoder_forward(latent_sample)
+            critic_prop_target = self.get_critic_prop_obs(next_observations_batch).detach()
+            prop_loss = nn.MSELoss()(critic_prop_predict, critic_prop_target)
+            kl_loss = -0.5 * torch.mean(
+                torch.sum(1 + latent_logvar - latent_mean.pow(2) - latent_logvar.exp(), dim=1)
+            )
+            total_loss = total_loss + prop_loss + self.beta * kl_loss
+            loss_dict["prop_loss"] = prop_loss.item()
+            loss_dict["kl_loss"] = kl_loss.item()
+
+        encoder_optimizer.zero_grad()
+        total_loss.backward()
+
+        encoder_params = [p for group in encoder_optimizer.param_groups for p in group["params"]]
+        nn.utils.clip_grad_norm_(encoder_params, max_grad_norm)
+
+        encoder_optimizer.step()
+        encoder_optimizer.zero_grad(set_to_none=True)
+
+        loss_dict["total_loss"] = total_loss.item()
+        return loss_dict
 
     def create_optimizers(self, learning_rate: float) -> dict[str, torch.optim.Optimizer]:
-        """创建优化器
-        
-        Args:
-            learning_rate: 学习率
-            
-        Returns:
-            优化器字典，包含主要的优化器和编码器优化器
-        """
+        """创建优化器"""
         import torch.optim as optim
-        
-        optimizer = optim.Adam([
-            {'params': self.actor.parameters()},
-            {'params': self.critic.parameters()},
-            {'params': [self.std] if self.noise_std_type == "scalar" else [self.log_std]},
-        ], lr=learning_rate)
-        
-        encoder_optimizer = optim.Adam([
-            {'params': self.encoder_backbone.parameters()},
-            {'params': self.encoder_latent_mean.parameters()},
-            {'params': self.encoder_latent_logvar.parameters()},
-            {'params': self.encoder_vel_mean.parameters()},
-            {'params': self.encoder_vel_logvar.parameters()},
-            {'params': self.decoder.parameters()},
-        ], lr=learning_rate)
-        
+
+        optimizer_params = [
+            {"params": self.actor.parameters()},
+            {"params": self.critic.parameters()},
+        ]
+        if not self.state_dependent_std:
+            optimizer_params.append(
+                {"params": [self.std] if self.noise_std_type == "scalar" else [self.log_std]}
+            )
+        optimizer = optim.Adam(optimizer_params, lr=learning_rate)
+
+        encoder_params = [
+            {"params": self.encoder_backbone.parameters()},
+            {"params": self.encoder_vel_mean.parameters()},
+        ]
+        if self.num_latent > 0:
+            encoder_params.extend(
+                [
+                    {"params": self.encoder_latent_mean.parameters()},
+                    {"params": self.encoder_latent_logvar.parameters()},
+                    {"params": self.decoder.parameters()},
+                ]
+            )
+        encoder_optimizer = optim.Adam(encoder_params, lr=learning_rate)
+
         return {
             "optimizer": optimizer,
-            "encoder_optimizer": encoder_optimizer
+            "encoder_optimizer": encoder_optimizer,
         }
 
-    def export_to_onnx(self, path: str, filename: str = "Estnet_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
-        """将VAE策略导出为ONNX格式
-        
-        Args:
-            path: 保存目录的路径
-            filename: 导出的ONNX文件名，默认为"Estnet_policy.onnx"
-            normalizer: 归一化模块，如果为None则使用Identity
-            verbose: 是否打印模型摘要，默认为False
-        """
-        import copy
-        import os
-        
+    def export_to_onnx(
+        self,
+        path: str,
+        filename: str = "VAE_policy.onnx",
+        normalizer: torch.nn.Module | None = None,
+        verbose: bool = False,
+    ) -> None:
+        """将VAE策略导出为ONNX格式"""
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
-            
-        # 创建VAE专用的导出器
+
         exporter = _VAEOnnxPolicyExporter(self, normalizer, verbose)
         exporter.export(path, filename)
 
 
 class _VAEOnnxPolicyExporter(torch.nn.Module):
-    """VAE策略的ONNX导出器"""
+    """VAE策略的ONNX导出器。
+
+    The ONNX input is a concatenation of [policy_new, policy_history].
+    """
 
     def __init__(self, policy: ActorCriticVAE, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
-        # 复制策略参数
-        if hasattr(policy, "actor"):
-            self.actor = copy.deepcopy(policy.actor)
-
-        # 复制编码器
+        self.actor = copy.deepcopy(policy.actor)
         self.encoder = copy.deepcopy(policy.encoder_backbone)
         self.encoder_vel_head = copy.deepcopy(policy.encoder_vel_mean)
-        self.encoder_latent_head = copy.deepcopy(policy.encoder_latent_mean)
-        # 一帧观测的长度
-        self.obs_one_frame_len = policy.obs_one_frame_len
-        if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
+        self.state_dependent_std = policy.state_dependent_std
+        self.num_actor_obs = policy.num_actor_obs
+        self.num_history_obs = policy.num_history_obs
+        self.num_latent = policy.num_latent
+
+        if self.num_latent > 0:
+            self.encoder_latent_head = copy.deepcopy(policy.encoder_latent_mean)
+
+        if normalizer is not None:
+            self.actor_obs_normalizer = copy.deepcopy(normalizer)
         else:
-            self.normalizer = torch.nn.Identity()
-    
-    def forward(self, obs):
-        obs_noarmalized = self.normalizer(obs)
-        x = self.encoder(obs_noarmalized)
-        vel = self.encoder_vel_head(x)
-        latent = self.encoder_latent_head(x)
-        code = torch.cat((vel, latent), dim=-1)
-        # TODO: 同步 policy history 顺序后，export wrapper 也需要改为取最后一帧。
-        now_obs = obs_noarmalized[:, 0:self.obs_one_frame_len]  # 获取当前观测值
-        observations = torch.cat((code.detach(), now_obs), dim=-1)
-        actions_mean = self.actor(observations)
-        return actions_mean, vel
-    
+            self.actor_obs_normalizer = copy.deepcopy(policy.actor_obs_normalizer)
+        self.history_obs_normalizer = copy.deepcopy(policy.history_obs_normalizer)
+
+    def forward(self, x: torch.Tensor):
+        actor_obs = x[:, : self.num_actor_obs]
+        history_obs = x[:, self.num_actor_obs : self.num_actor_obs + self.num_history_obs]
+
+        actor_obs = self.actor_obs_normalizer(actor_obs)
+        history_obs = self.history_obs_normalizer(history_obs)
+
+        features = self.encoder(history_obs)
+        est_vel = self.encoder_vel_head(features)
+
+        if self.num_latent > 0:
+            latent_mean = self.encoder_latent_head(features)
+            actor_input = torch.cat((est_vel.detach(), latent_mean.detach(), actor_obs), dim=-1)
+        else:
+            actor_input = torch.cat((est_vel.detach(), actor_obs), dim=-1)
+
+        actions_mean = self.actor(actor_input)
+        if self.state_dependent_std:
+            actions_mean = actions_mean[..., 0, :]
+
+        if self.num_latent > 0:
+            return actions_mean, est_vel, latent_mean
+        return actions_mean, est_vel
+
     def export(self, path, filename):
         self.to("cpu")
         self.eval()
         opset_version = 18
-        obs = torch.zeros(1, self.encoder[0].in_features)
+        obs = torch.zeros(1, self.num_actor_obs + self.num_history_obs)
+        output_names = ["actions", "est_vel"]
+        if self.num_latent > 0:
+            output_names.append("latent_mean")
         torch.onnx.export(
             self,
             obs,
@@ -479,6 +501,6 @@ class _VAEOnnxPolicyExporter(torch.nn.Module):
             opset_version=opset_version,
             verbose=self.verbose,
             input_names=["obs"],
-            output_names=["actions","est_vel"],
+            output_names=output_names,
             dynamic_axes={},
         )

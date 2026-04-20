@@ -37,9 +37,7 @@ class ActorCriticVAE(nn.Module):
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
-        num_decode: int = 30,
         num_latent: int = 16,
-        num_history_len: int = 5,
         VAE_beta: float = 1.0,
         use_adaboot: bool = False,
         **kwargs: dict[str, Any],
@@ -62,8 +60,6 @@ class ActorCriticVAE(nn.Module):
         self.state_dependent_std = state_dependent_std
         self.num_latent = num_latent
         # Kept for config/checkpoint compatibility. The new VAE infers dimensions from observation groups.
-        self.num_decoder = num_decode
-        self.num_history_len = num_history_len
         self.use_adaboot = use_adaboot
 
         # Observation dimensions for the separate VAE data paths.

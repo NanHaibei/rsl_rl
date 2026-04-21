@@ -25,14 +25,61 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributions import Normal
 from typing import Any, NoReturn
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
 import copy
-import math
 import os
+
+
+def _to_2tuple(value: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(value, tuple):
+        return value
+    return (value, value)
+
+
+class ElevationConvBlock(nn.Module):
+    """2D convolution block with optional circular padding along image width."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int],
+        padding_mode: str = "zeros",
+    ):
+        super().__init__()
+        self.padding_mode = padding_mode
+        kernel_h, kernel_w = _to_2tuple(kernel_size)
+        self.pad_h = kernel_h // 2
+        self.pad_w = kernel_w // 2
+
+        if padding_mode == "zeros":
+            conv_padding = (self.pad_h, self.pad_w)
+        elif padding_mode == "circular_width":
+            conv_padding = 0
+        else:
+            raise ValueError(f"Unsupported elevation CNN padding mode: {padding_mode}.")
+
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=conv_padding,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.padding_mode == "circular_width":
+            if self.pad_w > 0:
+                x = F.pad(x, (self.pad_w, self.pad_w, 0, 0), mode="circular")
+            if self.pad_h > 0:
+                x = F.pad(x, (0, 0, self.pad_h, self.pad_h), mode="constant", value=0.0)
+        return self.conv(x)
 
 
 class Elevation2DCNNEncoder(nn.Module):
@@ -44,19 +91,21 @@ class Elevation2DCNNEncoder(nn.Module):
                  kernel_sizes=[3, 3, 3],
                  strides=[2, 2, 2],
                  out_dim=64,
-                 vision_spatial_size=(25, 17)):
+                 vision_spatial_size=(25, 17),
+                 padding_mode: str = "zeros"):
         super().__init__()
+        self.padding_mode = padding_mode
         
         # 构建2DCNN卷积层
         layers = []
         now_channels = in_channels
         for i, (hidden_dim, kernel_size, stride) in enumerate(zip(hidden_dims, kernel_sizes, strides)):
-            layers.append(nn.Conv2d(
+            layers.append(ElevationConvBlock(
                 now_channels, 
                 hidden_dim, 
                 kernel_size=kernel_size,
                 stride=stride,
-                padding=kernel_size//2
+                padding_mode=padding_mode,
             ))
             layers.append(nn.BatchNorm2d(hidden_dim))
             layers.append(nn.ReLU(inplace=True))
@@ -122,6 +171,9 @@ class ActorCriticECMM(nn.Module):
         # Actor MLP特征提取器配置
         actor_mlp_feature_dim: int = 64,
         actor_mlp_hidden_dims: tuple[int] | list[int] = [128],
+        # 视觉输入归一化配置
+        vision_range_scale: float = 1.0,
+        vision_range_max: float = 10.0,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -133,17 +185,46 @@ class ActorCriticECMM(nn.Module):
         # 传递回Env的额外信息
         self.extra_info = dict()
         
-        # 高程图相关配置
-        height_scanner_pattern_cfg = env_cfg.scene.height_scanner.pattern_cfg
-        scan_size = height_scanner_pattern_cfg.size
-        scan_resolution = height_scanner_pattern_cfg.resolution
-        self.vision_spatial_size = (
-            math.ceil((float(scan_size[0]) + 1.0e-9) / float(scan_resolution)),
-            math.ceil((float(scan_size[1]) + 1.0e-9) / float(scan_resolution)),
-        )
+        # 高程图/雷达图相关配置：直接从观测张量推断，兼容 GridPatternCfg 和 LidarPatternCfg。
+        height_scan_obs = obs["height_scan_policy"]
+        if len(height_scan_obs.shape) != 4:
+            raise ValueError(
+                "height_scan_policy observation must have shape [B, T, H, W]. "
+                f"Received shape: {height_scan_obs.shape}."
+            )
+        self.elevation_history_length = height_scan_obs.shape[1]
+        self.vision_spatial_size = tuple(height_scan_obs.shape[-2:])
         self.vision_feature_dim = vision_feature_dim
         self.actor_mlp_feature_dim = actor_mlp_feature_dim
-        self.elevation_history_length = env_cfg.observations.height_scan_policy.height_scan.params["total_frames"]
+        self.vision_range_scale = float(vision_range_scale)
+        self.vision_range_max = float(vision_range_max)
+        if self.vision_range_scale <= 0.0:
+            raise ValueError(f"vision_range_scale must be positive. Received: {self.vision_range_scale}.")
+        if self.vision_range_max <= 0.0:
+            raise ValueError(f"vision_range_max must be positive. Received: {self.vision_range_max}.")
+        height_scan_func_name = None
+        if env_cfg is not None:
+            try:
+                height_scan_func = env_cfg.observations.height_scan_policy.height_scan.func
+                height_scan_func_name = getattr(height_scan_func, "__name__", str(height_scan_func))
+            except AttributeError:
+                height_scan_func_name = None
+
+        if height_scan_func_name == "lidar_range_scan_sampled":
+            self.vision_padding_mode = "circular_width"
+        elif height_scan_func_name == "height_scan_sampled":
+            self.vision_padding_mode = "zeros"
+        else:
+            self.vision_padding_mode = "zeros"
+            print(
+                "[WARN] Unknown height_scan_policy observation function "
+                f"'{height_scan_func_name}'. Falling back to zero padding."
+            )
+        print(f"Vision padding mode: {self.vision_padding_mode}")
+        print(
+            "Vision normalization: inverse_depth "
+            f"(vision_range_scale={self.vision_range_scale}, vision_range_max={self.vision_range_max})"
+        )
         
         # Critic CNN配置（如果没有指定，则使用Actor的配置）
         if critic_cnn_hidden_dims is None:
@@ -209,7 +290,8 @@ class ActorCriticECMM(nn.Module):
             kernel_sizes=actor_cnn_kernel_sizes,
             strides=actor_cnn_strides,
             out_dim=vision_feature_dim,
-            vision_spatial_size=self.vision_spatial_size
+            vision_spatial_size=self.vision_spatial_size,
+            padding_mode=self.vision_padding_mode,
         )
         print(f"Actor 2DCNN Encoder (history length={self.elevation_history_length}): {self.elevation_2dcnn_encoder_actor}")
         
@@ -220,7 +302,8 @@ class ActorCriticECMM(nn.Module):
             kernel_sizes=critic_cnn_kernel_sizes,
             strides=critic_cnn_strides,
             out_dim=vision_feature_dim,
-            vision_spatial_size=self.vision_spatial_size
+            vision_spatial_size=self.vision_spatial_size,
+            padding_mode=self.vision_padding_mode,
         )
         print(f"Critic 2DCNN Encoder (history length={self.elevation_history_length}): {self.elevation_2dcnn_encoder_critic}")
 
@@ -306,22 +389,16 @@ class ActorCriticECMM(nn.Module):
         self.distribution = Normal(mean, std)
     
     def _normalize_elevation_map(self, height_map: torch.Tensor) -> torch.Tensor:
-        """归一化多帧高程图历史
+        """使用 inverse-depth 归一化多帧视觉距离图。
         
         Args:
-            height_map: 高程图历史，形状为 [B, T, H, W]，T为历史帧数
+            height_map: 视觉距离图历史，形状为 [B, T, H, W]，T为历史帧数
         
         Returns:
             归一化后的高程图历史，形状与输入相同
         """
-        # 输入应该是 [B, T, H, W] 格式
-        # 对每个历史帧分别归一化
-        
-        # 归一化：对每个历史帧计算均值
-        height_map_mean = height_map.mean(dim=(-2, -1), keepdim=True)  # [B, T, 1, 1]
-        height_map = torch.clip((height_map - height_map_mean) / 0.6, -3.0, 3.0)
-        
-        return height_map
+        distance_map = torch.clamp(height_map, min=0.0, max=self.vision_range_max)
+        return 2.0 / (1.0 + distance_map / self.vision_range_scale) - 1.0
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         """训练时的动作采样
@@ -516,6 +593,8 @@ class _OnnxPolicyExporter(torch.nn.Module):
         self.proprio_obs_dim = policy.actor_mlp_extractor[0].in_features
         self.vision_spatial_size = policy.vision_spatial_size
         self.elevation_history_length = policy.elevation_history_length
+        self.vision_range_scale = policy.vision_range_scale
+        self.vision_range_max = policy.vision_range_max
 
         # 复制归一化器
         if normalizer:
@@ -524,19 +603,16 @@ class _OnnxPolicyExporter(torch.nn.Module):
             self.normalizer = torch.nn.Identity()
     
     def _normalize_elevation_map(self, height_map: torch.Tensor) -> torch.Tensor:
-        """归一化多帧高程图历史
+        """使用 inverse-depth 归一化多帧视觉距离图。
         
         Args:
-            height_map: 高程图历史，形状为 [B, T, H, W]，T为历史帧数
+            height_map: 视觉距离图历史，形状为 [B, T, H, W]，T为历史帧数
         
         Returns:
             归一化后的高程图历史，形状与输入相同
         """
-        # 对每个历史帧分别归一化
-        height_map_mean = height_map.mean(dim=(-2, -1), keepdim=True)  # [B, T, 1, 1]
-        height_map = torch.clip((height_map - height_map_mean) / 0.6, -3.0, 3.0)
-        
-        return height_map
+        distance_map = torch.clamp(height_map, min=0.0, max=self.vision_range_max)
+        return 2.0 / (1.0 + distance_map / self.vision_range_scale) - 1.0
     
     def forward(self, obs_concat):
         """

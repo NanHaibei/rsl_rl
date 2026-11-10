@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import AMPDiscriminator
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import (
     compile_model,
@@ -120,6 +121,7 @@ class PPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.use_mixed_precision = use_mixed_precision
+        self.amp_enabled = False
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -134,10 +136,19 @@ class PPO:
         self.transition.observations = obs
         return self.transition.actions  # type: ignore
 
-    def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
-    ) -> None:
+    def process_env_step(self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
         """Record one environment step."""
+        #################### AMP 奖励处理 ########################
+        if self.amp_enabled:
+            rewards, terminal_obs = self.amp_discriminator.process_env_step(
+                self.transition.observations,
+                obs,
+                rewards,
+                dones,
+                extras,
+                amp_obs_group=self.amp_obs_group,
+                amp_expert_obs_group=self.amp_expert_obs_group,
+            )
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -152,10 +163,17 @@ class PPO:
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
-                1,
-            )
+            if self.amp_enabled:
+                time_outs = extras["time_outs"].to(self.device).bool()
+                if time_outs.any():
+                    terminal_values = self.critic(terminal_obs).detach().squeeze(-1)
+                    self.transition.rewards += self.gamma * torch.where(time_outs, terminal_values, 0.0)
+            else:
+                # TODO: self.transition.values这一项不是下一帧的状态，有点bug上面的AMP实现反而是更合理的
+                self.transition.rewards += self.gamma * torch.squeeze(
+                    self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
+                    1,
+                )
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -199,6 +217,8 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        amp_statistics = torch.zeros(3, device=self.device) if self.amp_enabled else None
+        amp_updates = 0
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -313,6 +333,13 @@ class PPO:
             if self.rnd:
                 self.rnd.optimizer.step()
 
+            if self.amp_enabled:
+                statistics = self.amp_discriminator.update(original_batch_size)
+                if statistics is not None:
+                    assert amp_statistics is not None
+                    amp_statistics += statistics
+                    amp_updates += 1
+
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -352,6 +379,10 @@ class PPO:
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
+        if self.amp_enabled:
+            mean_amp = (amp_statistics / max(amp_updates, 1)).tolist()
+            loss_dict.update(amp_total=mean_amp[0], amp_discriminator=mean_amp[1], amp_gradient_penalty=mean_amp[2])
+
         # Clear the storage
         self.storage.clear()
 
@@ -363,6 +394,8 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        if self.amp_enabled:
+            self.amp_discriminator.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -370,6 +403,8 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.amp_enabled:
+            self.amp_discriminator.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -382,6 +417,15 @@ class PPO:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
             saved_dict["rnd_update_counter"] = self.rnd.update_counter
+        if self.amp_enabled:
+            amp = self.amp_discriminator
+            saved_dict.update(
+                amp_state_dict=amp.state_dict(),
+                amp_optimizer_state_dict=amp.optimizer.state_dict(),
+                amp_update_counter=amp.update_counter,
+                amp_observation_dim=amp.observation_dim,
+                amp_cfg=amp.cfg,
+            )
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -394,6 +438,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "amp": True,
             }
 
         # Load the specified models
@@ -408,6 +453,14 @@ class PPO:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
             self.rnd.update_counter = loaded_dict.get("rnd_update_counter", 0)
+        if self.amp_enabled:
+            amp = self.amp_discriminator
+            if load_cfg.get("amp"):
+                amp.load_state_dict(loaded_dict["amp_state_dict"], strict=strict)
+                amp.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+                amp.update_counter = loaded_dict["amp_update_counter"]
+            amp.policy_buffer.clear()
+            amp.expert_buffer.clear()
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -445,6 +498,28 @@ class PPO:
         # Resolve symmetry config if used
         alg_cfg = resolve_symmetry_config(alg_cfg, env)
 
+        amp_cfg = cfg.get("amp_cfg")
+        storage_obs = obs
+        if amp_cfg is not None:
+            for key in ("amp", "amp_expert"):
+                if len(cfg["obs_groups"].get(key, [])) != 1:
+                    raise ValueError(f"AMP requires exactly one observation group in obs_groups['{key}'].")
+            amp_obs_group = cfg["obs_groups"]["amp"][0]
+            amp_expert_obs_group = cfg["obs_groups"]["amp_expert"][0]
+            amp_obs = obs[amp_obs_group]
+            expert_pairs = obs[amp_expert_obs_group]
+            if amp_obs.ndim != 2 or amp_obs.shape[0] != env.num_envs or amp_obs.shape[1] < 1:
+                raise ValueError("AMP state observations must have shape [num_envs, D].")
+            if tuple(expert_pairs.shape) != (env.num_envs, 2, amp_obs.shape[1]):
+                raise ValueError("AMP expert observations must have shape [num_envs, 2, D] matching AMP states.")
+            if any(
+                amp_expert_obs_group in groups
+                for key, groups in cfg["obs_groups"].items()
+                if key != "amp_expert"
+            ):
+                raise ValueError("The AMP expert group must be used exclusively for expert sampling.")
+            storage_obs = obs.exclude(amp_expert_obs_group)
+
         # Initialize the policy
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
@@ -454,10 +529,25 @@ class PPO:
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], storage_obs, [env.num_actions], device)
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
+        if amp_cfg is not None:
+            if actor.is_recurrent or critic.is_recurrent:
+                raise ValueError("AMP currently requires feed-forward actor and critic models.")
+            if alg.symmetry:
+                raise ValueError("AMP symmetry augmentation is not supported.")
+            alg.amp_obs_group = amp_obs_group
+            alg.amp_expert_obs_group = amp_expert_obs_group
+            alg.amp_discriminator = AMPDiscriminator(
+                observation_dim=obs[alg.amp_obs_group].shape[-1],
+                amp_cfg=amp_cfg,
+                device=device,
+                multi_gpu_cfg=cfg["multi_gpu"],
+                grad_reduce_bucket_mb=alg.grad_reduce_bucket_mb,
+            )
+            alg.amp_enabled = True
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))
@@ -469,6 +559,8 @@ class PPO:
         models = [self._raw_actor, self._raw_critic]
         if self.rnd:
             models += [self.rnd.predictor, self.rnd.target]
+        if self.amp_enabled:
+            models.append(self.amp_discriminator)
         for model in models:
             for tensor in model.state_dict().values():
                 torch.distributed.broadcast(tensor, src=0)

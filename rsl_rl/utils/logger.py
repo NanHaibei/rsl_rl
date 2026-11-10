@@ -54,6 +54,8 @@ class Logger:
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.amp_reward_buffers: dict[str, deque] = {}
+        self.cur_amp_reward_sums: dict[str, torch.Tensor] = {}
 
         # Create RND buffers
         if self.cfg["algorithm"].get("rnd_cfg"):
@@ -140,6 +142,13 @@ class Logger:
             else:
                 self.cur_reward_sum += rewards
             self.cur_episode_length += 1
+            for name, component in extras.get("amp_rewards", {}).items():
+                if component.shape != (self.num_envs,):
+                    raise ValueError(f"AMP reward {name} must have shape [num_envs].")
+                if name not in self.amp_reward_buffers:
+                    self.amp_reward_buffers[name] = deque(maxlen=100)
+                    self.cur_amp_reward_sums[name] = torch.zeros(self.num_envs, device=self.device)
+                self.cur_amp_reward_sums[name] += component.to(self.device)
 
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -147,6 +156,9 @@ class Logger:
             self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
             self.cur_reward_sum[new_ids] = 0
             self.cur_episode_length[new_ids] = 0
+            for name, running_sum in self.cur_amp_reward_sums.items():
+                self.amp_reward_buffers[name].extend(running_sum[new_ids].flatten().cpu().tolist())
+                running_sum[new_ids] = 0
             if intrinsic_rewards is not None:
                 self.erewbuffer.extend(self.cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -206,6 +218,9 @@ class Logger:
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+            for name, values in self.amp_reward_buffers.items():
+                if values:
+                    self.writer.add_scalar(f"AMP/{name}_reward", statistics.mean(values), it)
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
@@ -251,6 +266,9 @@ class Logger:
             # Print losses
             for key, value in loss_dict.items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+            for name, values in self.amp_reward_buffers.items():
+                if values:
+                    log_string += f"""{f"Mean AMP {name} reward:":>{pad}} {statistics.mean(values):.2f}\n"""
 
             # Print rewards and episode length
             if len(self.rewbuffer) > 0:

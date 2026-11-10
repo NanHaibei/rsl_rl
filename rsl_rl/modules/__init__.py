@@ -5,6 +5,7 @@
 
 """Building blocks for neural models."""
 
+from .amp_discriminator import AMPDiscriminator
 from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
@@ -15,6 +16,7 @@ __all__ = [
     "CNN",
     "MLP",
     "RNN",
+    "AMPDiscriminator",
     "BetaDistribution",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",

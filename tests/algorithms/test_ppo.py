@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 import copy
+import pathlib
 import torch
 from tensordict import TensorDict
+from types import SimpleNamespace
 
 import pytest
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import CNNModel, MLPModel, RNNModel
+from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 from tests.conftest import make_obs
 
@@ -22,6 +25,18 @@ NUM_ENVS = 4
 NUM_STEPS = 8
 OBS_DIM = 8
 NUM_ACTIONS = 4
+AMP_CONFIG = {
+    "discriminator_hidden_dims": [16, 8],
+    "discriminator_activation": "relu",
+    "discriminator_obs_normalization": True,
+    "discriminator_learning_rate": 1e-3,
+    "discriminator_max_grad_norm": 1.0,
+    "gradient_penalty_coef": 10.0,
+    "replay_buffer_size": 100,
+    "discriminator_update_interval": 1,
+    "reward_coef": 2.0,
+    "task_reward_lerp": 0.25,
+}
 RND_CFG = {
     "num_states": OBS_DIM,
     "obs_groups": {"rnd_state": ["policy"]},
@@ -83,6 +98,219 @@ def _fill_rollout(ppo: PPO, obs: TensorDict) -> None:
         for _ in range(ppo.storage.num_transitions_per_env):
             ppo.act(obs)
             ppo.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+
+
+def _make_amp_ppo(interval: int = 1) -> tuple[PPO, TensorDict, dict]:
+    obs = TensorDict(
+        {
+            "policy": torch.randn(4, 6), "critic": torch.randn(4, 7),
+            "amp": torch.randn(4, 3), "amp_expert": torch.randn(4, 2, 3),
+        }, batch_size=[4]
+    )
+    amp_cfg = copy.deepcopy(AMP_CONFIG)
+    amp_cfg["discriminator_update_interval"] = interval
+    cfg = {
+        "algorithm": {"class_name": "PPO", "num_learning_epochs": 2, "num_mini_batches": 2, "schedule": "fixed"},
+        "actor": {
+            "class_name": "MLPModel",
+            "hidden_dims": [16],
+            "activation": "elu",
+            "distribution_cfg": {"class_name": "GaussianDistribution", "init_std": 1.0},
+        },
+        "critic": {"class_name": "MLPModel", "hidden_dims": [16], "activation": "elu"},
+        "obs_groups": {
+            "actor": ["policy"], "critic": ["critic"], "amp": ["amp"], "amp_expert": ["amp_expert"]
+        },
+        "num_steps_per_env": 4,
+        "multi_gpu": None,
+        "amp_cfg": amp_cfg,
+    }
+    env = SimpleNamespace(num_envs=4, num_actions=2)
+    return PPO.construct_algorithm(obs, env, cfg, "cpu"), obs, cfg
+
+
+def _fill_amp_rollout(ppo: PPO, obs: TensorDict) -> TensorDict:
+    with torch.inference_mode():
+        for _ in range(ppo.storage.num_transitions_per_env):
+            ppo.act(obs)
+            obs = obs.clone()
+            obs["policy"] = torch.randn(4, 6)
+            obs["critic"] = torch.randn(4, 7)
+            obs["amp"] = obs["amp"] + 0.1
+            obs["amp_expert"] = torch.randn(4, 2, 3)
+            ppo.process_env_step(
+                obs,
+                torch.ones(4),
+                torch.zeros(4, dtype=torch.long),
+                {},
+            )
+        ppo.compute_returns(obs)
+    return obs
+
+
+def test_amp_terminal_pairs_and_independent_experts() -> None:
+    """Use terminal policy states while collecting complete, independent expert pairs."""
+    ppo, obs, _ = _make_amp_ppo()
+    for parameter in ppo.amp_discriminator.parameters():
+        parameter.data.zero_()
+    ppo.amp_discriminator.network[-1].bias.data.fill_(1.0)
+    ppo.critic.forward = lambda data, **kwargs: data["critic"][:, :1]
+    obs["critic"][:, 0] = 5.0
+    ppo.act(obs)
+    assert "amp_expert" not in ppo.storage.observations
+    assert "amp_expert" in obs
+    following = obs.clone()
+    following["amp"] = torch.full((4, 3), -99.0)
+    following["amp_expert"] = torch.arange(24.0).reshape(4, 2, 3)
+    expert_pairs = following["amp_expert"].clone()
+    terminal = obs.clone()
+    terminal["amp"] = torch.full((4, 3), 77.0)
+    terminal["amp_expert"] = torch.full((4, 2, 3), 999.0)
+    terminal["critic"][:, 0] = 20.0
+    rewards = torch.arange(4.0)
+    dones = torch.tensor([1, 0, 1, 0])
+    extras = {"final_obs": terminal, "time_outs": torch.tensor([True, False, False, False])}
+    ppo.process_env_step(following, rewards, dones, extras)
+    expected_next = following["amp"].clone()
+    expected_next[dones.bool()] = terminal["amp"][dones.bool()]
+    torch.testing.assert_close(ppo.amp_discriminator.policy_buffer.states[:4], obs["amp"])
+    torch.testing.assert_close(ppo.amp_discriminator.policy_buffer.next_states[:4], expected_next)
+    torch.testing.assert_close(ppo.amp_discriminator.expert_buffer.states[:4], expert_pairs[:, 0])
+    torch.testing.assert_close(ppo.amp_discriminator.expert_buffer.next_states[:4], expert_pairs[:, 1])
+    assert len(ppo.amp_discriminator.policy_buffer) == len(ppo.amp_discriminator.expert_buffer) == 4
+    mixed = rewards * 0.25 + 1.5
+    expected_rewards = mixed.clone()
+    expected_rewards[0] += ppo.gamma * 20.0
+    torch.testing.assert_close(ppo.storage.rewards[0, :, 0], expected_rewards)
+    assert set(extras["amp_rewards"]) == {"task", "style", "final"}
+    torch.testing.assert_close(extras["amp_rewards"]["task"], rewards)
+    torch.testing.assert_close(extras["amp_rewards"]["style"], torch.full((4,), 2.0))
+    torch.testing.assert_close(extras["amp_rewards"]["final"], mixed)
+    torch.testing.assert_close(rewards, torch.arange(4.0))
+    torch.testing.assert_close(following["amp"], torch.full((4, 3), -99.0))
+    torch.testing.assert_close(following["amp_expert"], expert_pairs)
+    ppo.act(following)
+    ppo.process_env_step(following, rewards, torch.zeros(4, dtype=torch.long), {})
+    torch.testing.assert_close(ppo.amp_discriminator.policy_buffer.states[4:8], following["amp"])
+
+
+@pytest.mark.parametrize("case", ["state_shape", "pair_shape", "feature_dim", "missing_group", "policy_input"])
+def test_amp_rejects_incompatible_observation_groups(case: str) -> None:
+    """Reject ambiguous or malformed expert inputs before constructing storage."""
+    _, obs, cfg = _make_amp_ppo()
+    if case == "state_shape":
+        obs["amp"] = torch.zeros(4, 2, 3)
+    elif case == "pair_shape":
+        obs["amp_expert"] = torch.zeros(4, 3, 3)
+    elif case == "feature_dim":
+        obs["amp_expert"] = torch.zeros(4, 2, 4)
+    elif case == "missing_group":
+        del cfg["obs_groups"]["amp_expert"]
+    else:
+        cfg["obs_groups"]["actor"].append("amp_expert")
+    with pytest.raises(ValueError, match="AMP"):
+        PPO.construct_algorithm(obs, SimpleNamespace(num_envs=4, num_actions=2), cfg, "cpu")
+
+
+def test_amp_updates_follow_minibatches_and_checkpoint_restores_state() -> None:
+    """Update both networks on schedule and restore AMP training state."""
+    ppo, obs, _ = _make_amp_ppo(interval=3)
+    actor_before = [parameter.detach().clone() for parameter in ppo.actor.parameters()]
+    disc_before = [parameter.detach().clone() for parameter in ppo.amp_discriminator.parameters()]
+    obs = _fill_amp_rollout(ppo, obs)
+    metrics = ppo.update()
+    assert ppo.amp_discriminator.update_counter == 4
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert any(not torch.equal(a, b) for a, b in zip(actor_before, ppo.actor.parameters()))
+    assert any(not torch.equal(a, b) for a, b in zip(disc_before, ppo.amp_discriminator.parameters()))
+    saved = copy.deepcopy(ppo.save())
+    restored, _, _ = _make_amp_ppo(interval=3)
+    restored.load(saved, None, True)
+    assert restored.amp_discriminator.update_counter == 4
+    assert len(restored.amp_discriminator.policy_buffer) == len(restored.amp_discriminator.expert_buffer) == 0
+    for name, value in ppo.amp_discriminator.state_dict().items():
+        torch.testing.assert_close(restored.amp_discriminator.state_dict()[name], value)
+    _fill_amp_rollout(restored, obs)
+    restored.update()
+    assert restored.amp_discriminator.update_counter == 8
+    restored.eval_mode()
+    assert not restored.amp_discriminator.training
+    restored.train_mode()
+    assert restored.amp_discriminator.training
+
+
+def test_amp_empty_expert_buffer_skips_discriminator_updates() -> None:
+    """Skip discriminator optimization until both ranks of samples exist."""
+    ppo, obs, _ = _make_amp_ppo()
+    for _ in range(4):
+        ppo.act(obs)
+        ppo.process_env_step(
+            obs,
+            torch.ones(4),
+            torch.zeros(4, dtype=torch.long),
+            {},
+        )
+    ppo.compute_returns(obs)
+    ppo.amp_discriminator.expert_buffer.clear()
+    result = ppo.update()
+    assert result["amp_total"] == 0
+
+
+def test_amp_requires_terminal_observations_and_complete_checkpoint() -> None:
+    """Reject missing boundary data and incomplete AMP checkpoint state."""
+    ppo, obs, _ = _make_amp_ppo()
+    ppo.act(obs)
+    with pytest.raises(KeyError, match="final_obs"):
+        ppo.process_env_step(
+            obs,
+            torch.ones(4),
+            torch.ones(4, dtype=torch.long),
+            {},
+        )
+    old_checkpoint = ppo.save()
+    del old_checkpoint["amp_state_dict"]
+    with pytest.raises(KeyError, match="amp_state_dict"):
+        ppo.load(old_checkpoint, None, True)
+    ppo.load(old_checkpoint, {"actor": True, "critic": True, "amp": False}, True)
+
+
+def test_amp_flag_is_disabled_without_configuration() -> None:
+    """Keep ordinary PPO independent of AMP state."""
+    ppo, obs = _build_ppo()
+    assert not ppo.amp_enabled
+    extras = {}
+    with torch.no_grad():
+        ppo.act(obs)
+        ppo.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), extras)
+    assert "amp_rewards" not in extras
+
+
+def test_amp_runner_logs_task_rewards_separately_from_training_rewards(tmp_path: pathlib.Path) -> None:
+    """Keep the primary episode log on task rewards while PPO trains on mixed rewards."""
+    _, obs, cfg = _make_amp_ppo()
+    cfg["save_interval"] = 100
+    rewards = torch.full((4,), 4.0)
+    extras = {"final_obs": obs}
+    env = SimpleNamespace(
+        num_envs=4,
+        num_actions=2,
+        device="cpu",
+        cfg={},
+        get_observations=lambda: obs,
+        step=lambda actions: (obs, rewards, torch.ones(4, dtype=torch.long), extras),
+    )
+    runner = OnPolicyRunner(env, cfg, log_dir=str(tmp_path))
+    with torch.no_grad():
+        for parameter in runner.alg.amp_discriminator.parameters():
+            parameter.zero_()
+        runner.alg.amp_discriminator.network[-1].bias.fill_(1.0)
+    runner.learn(1)
+    runner.logger.writer.close()
+    assert list(runner.logger.rewbuffer) == [4.0] * 16
+    assert list(runner.logger.amp_reward_buffers["task"]) == [4.0] * 16
+    assert list(runner.logger.amp_reward_buffers["style"]) == [2.0] * 16
+    assert list(runner.logger.amp_reward_buffers["final"]) == [2.5] * 16
+    torch.testing.assert_close(runner.alg.storage.rewards, torch.full((4, 4, 1), 2.5))
 
 
 def _build_ppo_with_shared_cnn() -> PPO:

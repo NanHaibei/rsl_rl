@@ -19,10 +19,12 @@ class RecordingWriter(LogWriter):
 
     def __init__(self) -> None:  # noqa: D107
         self.tags: list[str] = []
+        self.scalars: dict[str, float] = {}
         self.videos: list[tuple[pathlib.Path, int]] = []
 
     def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:  # noqa: D102
         self.tags.append(tag)
+        self.scalars[tag] = scalar_value
 
     def save_video(self, video: pathlib.Path, it: int) -> None:  # noqa: D102
         self.videos.append((video, it))
@@ -89,3 +91,39 @@ class TestTimeSeries:
 
         assert "Train/mean_reward" in logger.writer.tags
         assert not any(tag.endswith("/time") for tag in logger.writer.tags)
+
+
+def test_amp_rewards(tmp_path: pathlib.Path) -> None:
+    """Accumulate and reset AMP episode rewards without changing the primary reward log."""
+    logger = _make_logger(tmp_path)
+    amp_rewards = {"task": torch.tensor([2.0]), "style": torch.tensor([4.0]), "final": torch.tensor([3.0])}
+    for done in (0, 1):
+        logger.process_env_step(torch.tensor([2.0]), torch.tensor([done]), {"amp_rewards": amp_rewards})
+    assert list(logger.rewbuffer) == [4.0]
+    assert list(logger.amp_reward_buffers["task"]) == [4.0]
+    assert list(logger.amp_reward_buffers["style"]) == [8.0]
+    assert list(logger.amp_reward_buffers["final"]) == [6.0]
+    logger.process_env_step(
+        torch.tensor([2.0]),
+        torch.tensor([1]),
+        {"amp_rewards": amp_rewards},
+    )
+    assert list(logger.rewbuffer) == [4.0, 2.0]
+    assert list(logger.amp_reward_buffers["task"]) == [4.0, 2.0]
+    assert list(logger.amp_reward_buffers["style"]) == [8.0, 4.0]
+    assert list(logger.amp_reward_buffers["final"]) == [6.0, 3.0]
+    logger.log(
+        it=0,
+        start_it=0,
+        total_it=1,
+        collect_time=0.1,
+        learn_time=0.1,
+        loss_dict={},
+        learning_rate=1e-3,
+        action_std=torch.ones(1),
+        rnd_weight=None,
+    )
+    assert logger.writer.scalars["Train/mean_reward"] == 3.0
+    assert logger.writer.scalars["AMP/task_reward"] == 3.0
+    assert logger.writer.scalars["AMP/style_reward"] == 6.0
+    assert logger.writer.scalars["AMP/final_reward"] == 4.5

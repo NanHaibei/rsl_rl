@@ -48,11 +48,42 @@ class AMPDiscriminator(nn.Module):
             else nn.Identity()
         )
         self.to(device)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=amp_cfg["discriminator_learning_rate"])
+        head_parameters = list(self.network[-1].parameters())
+        head_parameter_ids = {id(parameter) for parameter in head_parameters}
+        trunk_parameters = [
+            parameter for parameter in self.network.parameters() if id(parameter) not in head_parameter_ids
+        ]
+        self.optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": trunk_parameters,
+                    "weight_decay": amp_cfg.get("discriminator_trunk_weight_decay", 0.0),
+                    "name": "amp_trunk",
+                },
+                {
+                    "params": head_parameters,
+                    "weight_decay": amp_cfg.get("discriminator_head_weight_decay", 0.0),
+                    "name": "amp_head",
+                },
+            ],
+            lr=amp_cfg["discriminator_learning_rate"],
+        )
 
         self.policy_buffer = AMPReplayBuffer(observation_dim, amp_cfg["replay_buffer_size"], device)
         self.expert_buffer = AMPReplayBuffer(observation_dim, amp_cfg["replay_buffer_size"], device)
         self.update_counter = 0
+
+    def sync_learning_rate(self, policy_learning_rate: float) -> None:
+        """Apply PPO's current learning rate when policy following is enabled."""
+        if self.cfg.get("discriminator_follow_policy_lr", False):
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = policy_learning_rate
+
+    def load_optimizer_state_dict(self, state_dict: dict) -> None:
+        """Restore Adam state while applying the configured weight decay."""
+        self.optimizer.load_state_dict(state_dict)
+        self.optimizer.param_groups[0]["weight_decay"] = self.cfg.get("discriminator_trunk_weight_decay", 0.0)
+        self.optimizer.param_groups[1]["weight_decay"] = self.cfg.get("discriminator_head_weight_decay", 0.0)
 
     @torch.no_grad()
     def process_env_step(
@@ -143,7 +174,7 @@ class AMPDiscriminator(nn.Module):
         expert_states: torch.Tensor,
         expert_next_states: torch.Tensor,
         gradient_penalty_coef: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute least-squares loss and a zero-centered penalty on normalized expert inputs."""
         if isinstance(self.normalizer, EmpiricalNormalization):
             with torch.no_grad():
@@ -163,4 +194,4 @@ class AMPDiscriminator(nn.Module):
         gradient = torch.autograd.grad(expert_score.sum(), expert_input, create_graph=True)[0]
         gradient_penalty = gradient.square().sum(dim=-1).mean()
         loss = discriminator_loss + gradient_penalty_coef * gradient_penalty
-        return loss, discriminator_loss, gradient_penalty
+        return loss, discriminator_loss, gradient_penalty, policy_score.detach().mean(), expert_score.detach().mean()

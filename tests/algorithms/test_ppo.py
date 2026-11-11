@@ -30,6 +30,9 @@ AMP_CONFIG = {
     "discriminator_activation": "relu",
     "discriminator_obs_normalization": True,
     "discriminator_learning_rate": 1e-3,
+    "discriminator_follow_policy_lr": False,
+    "discriminator_trunk_weight_decay": 0.0,
+    "discriminator_head_weight_decay": 0.0,
     "discriminator_max_grad_norm": 1.0,
     "gradient_penalty_coef": 10.0,
     "replay_buffer_size": 100,
@@ -100,7 +103,9 @@ def _fill_rollout(ppo: PPO, obs: TensorDict) -> None:
             ppo.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), {})
 
 
-def _make_amp_ppo(interval: int = 1) -> tuple[PPO, TensorDict, dict]:
+def _make_amp_ppo(
+    interval: int = 1, amp_overrides: dict | None = None, **algorithm_overrides: object
+) -> tuple[PPO, TensorDict, dict]:
     obs = TensorDict(
         {
             "policy": torch.randn(4, 6), "critic": torch.randn(4, 7),
@@ -109,6 +114,7 @@ def _make_amp_ppo(interval: int = 1) -> tuple[PPO, TensorDict, dict]:
     )
     amp_cfg = copy.deepcopy(AMP_CONFIG)
     amp_cfg["discriminator_update_interval"] = interval
+    amp_cfg.update(amp_overrides or {})
     cfg = {
         "algorithm": {"class_name": "PPO", "num_learning_epochs": 2, "num_mini_batches": 2, "schedule": "fixed"},
         "actor": {
@@ -125,6 +131,7 @@ def _make_amp_ppo(interval: int = 1) -> tuple[PPO, TensorDict, dict]:
         "multi_gpu": None,
         "amp_cfg": amp_cfg,
     }
+    cfg["algorithm"].update(algorithm_overrides)
     env = SimpleNamespace(num_envs=4, num_actions=2)
     return PPO.construct_algorithm(obs, env, cfg, "cpu"), obs, cfg
 
@@ -146,6 +153,86 @@ def _fill_amp_rollout(ppo: PPO, obs: TensorDict) -> TensorDict:
             )
         ppo.compute_returns(obs)
     return obs
+
+
+@pytest.mark.parametrize("follow_policy_lr", [False, True])
+@pytest.mark.parametrize("kl, factor", [(0.03, 1.0 / 1.5), (0.002, 1.5)])
+def test_amp_learning_rate_tracks_each_minibatch_including_skipped_updates(
+    monkeypatch: pytest.MonkeyPatch, follow_policy_lr: bool, kl: float, factor: float
+) -> None:
+    """Follow adaptive PPO rates only when enabled, including skipped discriminator updates."""
+    ppo, obs, _ = _make_amp_ppo(
+        interval=3,
+        amp_overrides={"discriminator_follow_policy_lr": follow_policy_lr, "discriminator_learning_rate": 5e-4},
+        schedule="adaptive",
+        learning_rate=1e-3,
+        num_learning_epochs=1,
+        num_mini_batches=2,
+    )
+    discriminator = ppo.amp_discriminator
+    initial_lr = 1e-3 if follow_policy_lr else 5e-4
+    assert all(group["lr"] == pytest.approx(initial_lr) for group in discriminator.optimizer.param_groups)
+    _fill_amp_rollout(ppo, obs)
+    monkeypatch.setattr(ppo.actor, "get_kl_divergence", lambda *_: torch.tensor(kl))
+    original_update = discriminator.update
+    observed_rates = []
+    actual_updates = []
+
+    def record_update(batch_size: int) -> torch.Tensor | None:
+        observed_rates.append([group["lr"] for group in discriminator.optimizer.param_groups])
+        statistics = original_update(batch_size)
+        actual_updates.append(statistics is not None)
+        return statistics
+
+    monkeypatch.setattr(discriminator, "update", record_update)
+    metrics = ppo.update()
+    for index, rates in enumerate(observed_rates, start=1):
+        expected_lr = 1e-3 * factor**index if follow_policy_lr else 5e-4
+        assert rates == pytest.approx([expected_lr, expected_lr])
+    assert actual_updates == [True, False]
+    assert ppo.learning_rate == pytest.approx(1e-3 * factor**2)
+    assert metrics["amp_learning_rate"] == pytest.approx(observed_rates[-1][0])
+
+
+@pytest.mark.parametrize("follow_policy_lr", [False, True])
+def test_amp_checkpoint_restores_adam_state_and_applies_current_optimizer_settings(follow_policy_lr: bool) -> None:
+    """Keep Adam moments while restoring learning rates and applying configured decay."""
+    amp_overrides = {
+        "discriminator_follow_policy_lr": follow_policy_lr,
+        "discriminator_learning_rate": 5e-4,
+        "discriminator_trunk_weight_decay": 1e-3,
+        "discriminator_head_weight_decay": 1e-1,
+    }
+    ppo, obs, _ = _make_amp_ppo(amp_overrides=amp_overrides, learning_rate=8e-4)
+    _fill_amp_rollout(ppo, obs)
+    ppo.update()
+    saved = copy.deepcopy(ppo.save())
+    restored, _, _ = _make_amp_ppo(
+        amp_overrides={
+            **amp_overrides,
+            "discriminator_learning_rate": 9e-4,
+            "discriminator_trunk_weight_decay": 2e-3,
+            "discriminator_head_weight_decay": 2e-1,
+        },
+        learning_rate=3e-4,
+    )
+    restored.load(saved, None, True)
+    source_optimizer = ppo.amp_discriminator.optimizer
+    restored_optimizer = restored.amp_discriminator.optimizer
+    expected_lr = 8e-4 if follow_policy_lr else 5e-4
+    assert all(group["lr"] == pytest.approx(expected_lr) for group in restored_optimizer.param_groups)
+    assert [group["weight_decay"] for group in restored_optimizer.param_groups] == pytest.approx([2e-3, 2e-1])
+    for source_group, restored_group in zip(source_optimizer.param_groups, restored_optimizer.param_groups):
+        for source_parameter, restored_parameter in zip(source_group["params"], restored_group["params"]):
+            assert (
+                source_optimizer.state[source_parameter].keys() == restored_optimizer.state[restored_parameter].keys()
+            )
+            for key, value in source_optimizer.state[source_parameter].items():
+                torch.testing.assert_close(restored_optimizer.state[restored_parameter][key], value)
+    if follow_policy_lr:
+        restored.learning_rate = 6e-4
+        restored.load(saved, {"amp": True}, True)
+        assert all(group["lr"] == pytest.approx(6e-4) for group in restored_optimizer.param_groups)
 
 
 def test_amp_terminal_pairs_and_independent_experts() -> None:
@@ -218,8 +305,12 @@ def test_amp_updates_follow_minibatches_and_checkpoint_restores_state() -> None:
     actor_before = [parameter.detach().clone() for parameter in ppo.actor.parameters()]
     disc_before = [parameter.detach().clone() for parameter in ppo.amp_discriminator.parameters()]
     obs = _fill_amp_rollout(ppo, obs)
+    for param_group in ppo.amp_discriminator.optimizer.param_groups:
+        param_group["lr"] = 2e-4
     metrics = ppo.update()
     assert ppo.amp_discriminator.update_counter == 4
+    assert {"amp_policy_pred", "amp_expert_pred"} <= metrics.keys()
+    assert metrics["amp_learning_rate"] == pytest.approx(2e-4)
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
     assert any(not torch.equal(a, b) for a, b in zip(actor_before, ppo.actor.parameters()))
     assert any(not torch.equal(a, b) for a, b in zip(disc_before, ppo.amp_discriminator.parameters()))
@@ -254,6 +345,9 @@ def test_amp_empty_expert_buffer_skips_discriminator_updates() -> None:
     ppo.amp_discriminator.expert_buffer.clear()
     result = ppo.update()
     assert result["amp_total"] == 0
+    assert "amp_policy_pred" not in result
+    assert "amp_expert_pred" not in result
+    assert result["amp_learning_rate"] == ppo.amp_discriminator.optimizer.param_groups[0]["lr"]
 
 
 def test_amp_requires_terminal_observations_and_complete_checkpoint() -> None:

@@ -8,23 +8,58 @@
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.modules import AMPDiscriminator
 
 
-def _make_discriminator(obs_normalization: bool = True, interval: int = 1) -> AMPDiscriminator:
+def _make_discriminator(obs_normalization: bool = True, interval: int = 1, **amp_overrides: object) -> AMPDiscriminator:
+    amp_cfg = {
+        "discriminator_hidden_dims": [4],
+        "discriminator_activation": "relu",
+        "discriminator_obs_normalization": obs_normalization,
+        "discriminator_learning_rate": 1e-3,
+        "discriminator_follow_policy_lr": False,
+        "discriminator_trunk_weight_decay": 0.0,
+        "discriminator_head_weight_decay": 0.0,
+        "discriminator_max_grad_norm": 1.0,
+        "gradient_penalty_coef": 10.0,
+        "replay_buffer_size": 16,
+        "discriminator_update_interval": interval,
+    }
+    amp_cfg.update(amp_overrides)
     return AMPDiscriminator(
         observation_dim=2,
-        amp_cfg={
-            "discriminator_hidden_dims": [4],
-            "discriminator_activation": "relu",
-            "discriminator_obs_normalization": obs_normalization,
-            "discriminator_learning_rate": 1e-3,
-            "discriminator_max_grad_norm": 1.0,
-            "gradient_penalty_coef": 10.0,
-            "replay_buffer_size": 16,
-            "discriminator_update_interval": interval,
-        },
+        amp_cfg=amp_cfg,
     )
+
+
+@pytest.mark.parametrize("trunk_decay, head_decay", [(0.0, 0.0), (1e-3, 1e-1)])
+def test_optimizer_groups_apply_weight_decay_to_weights_and_biases(trunk_decay: float, head_decay: float) -> None:
+    """Cover all parameters once and match the first Adam step with zero gradients."""
+    discriminator = _make_discriminator(
+        discriminator_trunk_weight_decay=trunk_decay,
+        discriminator_head_weight_decay=head_decay,
+    )
+    trunk, head = discriminator.optimizer.param_groups
+    trunk_ids = {id(parameter) for parameter in trunk["params"]}
+    head_ids = {id(parameter) for parameter in head["params"]}
+    assert not trunk_ids & head_ids
+    assert trunk_ids | head_ids == {id(parameter) for parameter in discriminator.parameters()}
+    assert head_ids == {id(parameter) for parameter in discriminator.network[-1].parameters()}
+    assert len(trunk["params"]) + len(head["params"]) == len(list(discriminator.parameters()))
+    assert trunk["weight_decay"] == trunk_decay
+    assert head["weight_decay"] == head_decay
+    with torch.no_grad():
+        for parameter in discriminator.parameters():
+            parameter.fill_(1.0)
+            parameter.grad = torch.zeros_like(parameter)
+    discriminator.optimizer.step()
+    for group in (trunk, head):
+        decay = group["weight_decay"]
+        expected = 1.0 - group["lr"] * decay / (decay + group["eps"])
+        for parameter in group["params"]:
+            torch.testing.assert_close(parameter, torch.full_like(parameter, expected))
 
 
 def test_style_reward_bounds_and_least_squares_targets() -> None:
@@ -53,9 +88,12 @@ def test_gradient_penalty_uses_normalized_inputs_and_detaches_samples() -> None:
         discriminator.network[-1].weight.fill_(1.0)
         discriminator.network[-1].bias.zero_()
     states = torch.ones(3, 2, requires_grad=True)
-    values = discriminator.compute_loss(states, states, states, states, 10.0)
+    values = discriminator.compute_loss(states, states, states + 1.0, states + 1.0, 10.0)
     torch.testing.assert_close(values[2], torch.tensor(4.0))
     torch.testing.assert_close(values[0], values[1] + 40.0)
+    torch.testing.assert_close(values[3], torch.tensor(400.0 + 4.0 / (2.0 + discriminator.normalizer.eps)))
+    torch.testing.assert_close(values[4], torch.tensor(400.0 + 8.0 / (2.0 + discriminator.normalizer.eps)))
+    assert not values[3].requires_grad and not values[4].requires_grad
     values[0].backward()
     assert states.grad is None
     assert all(torch.isfinite(parameter.grad).all() for parameter in discriminator.parameters())
@@ -102,7 +140,7 @@ def test_update_owns_replay_optimizer_and_schedule() -> None:
     assert discriminator.update(4) is None
     statistics = discriminator.update(4)
     assert discriminator.update_counter == 4
-    assert statistics.shape == (3,)
+    assert statistics.shape == (5,)
     assert torch.isfinite(statistics).all()
     assert not statistics.requires_grad
     assert discriminator.optimizer.state

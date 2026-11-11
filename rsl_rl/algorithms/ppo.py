@@ -217,7 +217,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
-        amp_statistics = torch.zeros(3, device=self.device) if self.amp_enabled else None
+        amp_statistics = torch.zeros(5, device=self.device) if self.amp_enabled else None
         amp_updates = 0
 
         # Get mini-batch generator
@@ -334,6 +334,7 @@ class PPO:
                 self.rnd.optimizer.step()
 
             if self.amp_enabled:
+                self.amp_discriminator.sync_learning_rate(self.learning_rate)
                 statistics = self.amp_discriminator.update(original_batch_size)
                 if statistics is not None:
                     assert amp_statistics is not None
@@ -382,6 +383,9 @@ class PPO:
         if self.amp_enabled:
             mean_amp = (amp_statistics / max(amp_updates, 1)).tolist()
             loss_dict.update(amp_total=mean_amp[0], amp_discriminator=mean_amp[1], amp_gradient_penalty=mean_amp[2])
+            if amp_updates:
+                loss_dict.update(amp_policy_pred=mean_amp[3], amp_expert_pred=mean_amp[4])
+            loss_dict["amp_learning_rate"] = self.amp_discriminator.optimizer.param_groups[0]["lr"]
 
         # Clear the storage
         self.storage.clear()
@@ -457,8 +461,9 @@ class PPO:
             amp = self.amp_discriminator
             if load_cfg.get("amp"):
                 amp.load_state_dict(loaded_dict["amp_state_dict"], strict=strict)
-                amp.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+                amp.load_optimizer_state_dict(loaded_dict["amp_optimizer_state_dict"])
                 amp.update_counter = loaded_dict["amp_update_counter"]
+            amp.sync_learning_rate(self.learning_rate)
             amp.policy_buffer.clear()
             amp.expert_buffer.clear()
         return load_cfg.get("iteration", False)
@@ -547,6 +552,7 @@ class PPO:
                 multi_gpu_cfg=cfg["multi_gpu"],
                 grad_reduce_bucket_mb=alg.grad_reduce_bucket_mb,
             )
+            alg.amp_discriminator.sync_learning_rate(alg.learning_rate)
             alg.amp_enabled = True
 
         # Compile the algorithm's models if requested

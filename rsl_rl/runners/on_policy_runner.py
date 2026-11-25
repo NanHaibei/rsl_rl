@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import torch
 
@@ -194,6 +195,9 @@ class OnPolicyRunner:
 
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
+        # The default name is replaced by ``{experiment_name}_{run_name}_{time}.onnx``
+        if filename == "policy.onnx":
+            filename = self._get_onnx_filename(path)
         save_path = os.path.join(path, filename)
 
         # Trace and save the model
@@ -206,7 +210,25 @@ class OnPolicyRunner:
             verbose=verbose,
             input_names=onnx_model.input_names,  # type: ignore
             output_names=onnx_model.output_names,  # type: ignore
+            external_data=False,  # embed weights in the .onnx file instead of a separate .onnx.data file
         )
+
+    def _get_onnx_filename(self, export_dir: str) -> str:
+        """Build the ONNX file name as ``{experiment_name}_{run_name}_{time}.onnx``.
+
+        The run name and time are parsed from the run directory (``YYYY-mm-dd_HH-MM-SS[_run_name]``), which is the
+        parent of the ``exported`` directory. When it does not follow this pattern, the configured run name and the
+        current time are used instead.
+        """
+        export_dir = os.path.abspath(export_dir)
+        run_dir = os.path.dirname(export_dir) if os.path.basename(export_dir) == "exported" else export_dir
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?:_(.+))?", os.path.basename(run_dir))
+        if match:
+            time_str, run_name = match.group(1), match.group(2) or ""
+        else:
+            time_str, run_name = time.strftime("%Y-%m-%d_%H-%M-%S"), self.cfg.get("run_name") or ""
+        parts = [self.cfg.get("experiment_name") or "", run_name, time_str]
+        return "_".join(part for part in parts if part) + ".onnx"
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""

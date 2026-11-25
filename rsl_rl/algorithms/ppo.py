@@ -97,10 +97,24 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
-        # Create the optimizer
+        # Create the optimizer (keep optional estimator encoder/decoder on its own optimizer)
         self.optimizer = resolve_optimizer(optimizer)(
-            list(dict.fromkeys(chain(self.actor.parameters(), self.critic.parameters()))), lr=learning_rate
+            list(dict.fromkeys(chain(self._actor_policy_parameters(), self.critic.parameters()))), lr=learning_rate
         )  # type: ignore
+        encoder_params = self._actor_encoder_parameters()
+        self._has_encoder = hasattr(self._raw_actor, "compute_encoder_loss") and len(encoder_params) > 0
+        if self._has_encoder:
+            encoder_lr = getattr(self._raw_actor, "encoder_learning_rate", None)
+            encoder_lr = learning_rate if encoder_lr is None else encoder_lr
+            self.encoder_optimizer: torch.optim.Optimizer | None = resolve_optimizer(optimizer)(
+                encoder_params, lr=encoder_lr
+            )
+            self._encoder_follow_policy_lr = bool(getattr(self._raw_actor, "encoder_follow_policy_lr", True))
+            self._encoder_max_grad_norm = float(getattr(self._raw_actor, "encoder_max_grad_norm", max_grad_norm))
+        else:
+            self.encoder_optimizer = None
+            self._encoder_follow_policy_lr = False
+            self._encoder_max_grad_norm = max_grad_norm
 
         # Add storage
         self.storage = storage
@@ -153,6 +167,24 @@ class PPO:
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+
+        # Record next-step decoder target when the actor uses an auxiliary reconstruction decoder
+        if getattr(self._raw_actor, "requires_next_decoder_obs", False):
+            next_decoder_obs = self._raw_actor.get_decoder_target_obs(obs).clone()
+            done_mask = dones.bool()
+            next_decoder_valid = torch.ones(obs.batch_size[0], 1, dtype=torch.bool, device=self.device)
+            if done_mask.any():
+                if "final_obs" in extras:
+                    final_td = (
+                        terminal_obs
+                        if self.amp_enabled and terminal_obs is not None
+                        else TensorDict(extras["final_obs"], batch_size=obs.batch_size, device=self.device)
+                    )
+                    next_decoder_obs[done_mask] = self._raw_actor.get_decoder_target_obs(final_td)[done_mask]
+                else:
+                    next_decoder_valid[done_mask] = False
+            self.transition.next_decoder_obs = next_decoder_obs
+            self.transition.next_decoder_valid = next_decoder_valid
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -217,6 +249,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        encoder_losses_dict: dict[str, float] = {}
         amp_statistics = torch.zeros(5, device=self.device) if self.amp_enabled else None
         amp_updates = 0
 
@@ -284,6 +317,9 @@ class PPO:
                         # Update the learning rate for all parameter groups
                         for param_group in self.optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
+                        if self.encoder_optimizer is not None and self._encoder_follow_policy_lr:
+                            for param_group in self.encoder_optimizer.param_groups:
+                                param_group["lr"] = self.learning_rate
 
                 # Surrogate loss
                 ratio = torch.exp(actions_log_prob - batch.old_actions_log_prob.squeeze(-1))  # type: ignore
@@ -326,12 +362,36 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self._actor_policy_parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
+
+            # Update estimator encoder/decoder separately in float32
+            if self.encoder_optimizer is not None:
+                with torch.amp.autocast(device_type=torch.device(self.device).type, enabled=False):  # type: ignore
+                    obs_enc = batch.observations[:original_batch_size]
+                    next_dec = (
+                        batch.next_decoder_obs[:original_batch_size] if batch.next_decoder_obs is not None else None
+                    )
+                    valid_mask = (
+                        batch.next_decoder_valid[:original_batch_size].squeeze(-1)
+                        if batch.next_decoder_valid is not None
+                        else None
+                    )
+                    enc_loss, enc_loss_dict = self._raw_actor.compute_encoder_loss(obs_enc, next_dec, valid_mask)
+                self.encoder_optimizer.zero_grad()
+                enc_loss.backward()
+                enc_params = self._actor_encoder_parameters()
+                if self.is_multi_gpu:
+                    reduce_gradients_in_buckets(enc_params, self.gpu_world_size, self.grad_reduce_bucket_mb)
+                nn.utils.clip_grad_norm_(enc_params, self._encoder_max_grad_norm)
+                self.encoder_optimizer.step()
+                self.encoder_optimizer.zero_grad(set_to_none=True)
+                for loss_key, loss_value in enc_loss_dict.items():
+                    encoder_losses_dict[loss_key] = encoder_losses_dict.get(loss_key, 0.0) + loss_value
 
             if self.amp_enabled:
                 self.amp_discriminator.sync_learning_rate(self.learning_rate)
@@ -368,6 +428,8 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        for loss_key in encoder_losses_dict:
+            encoder_losses_dict[loss_key] /= num_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -379,6 +441,7 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        loss_dict.update(encoder_losses_dict)
 
         if self.amp_enabled:
             mean_amp = (amp_statistics / max(amp_updates, 1)).tolist()
@@ -417,6 +480,8 @@ class PPO:
             "critic_state_dict": self._raw_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
+        if self.encoder_optimizer is not None:
+            saved_dict["encoder_optimizer_state_dict"] = self.encoder_optimizer.state_dict()
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
@@ -453,6 +518,13 @@ class PPO:
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             self.learning_rate = self.optimizer.param_groups[0]["lr"]
+        if self.encoder_optimizer is not None:
+            load_enc_opt = load_cfg.get("encoder_optimizer", load_cfg.get("optimizer", True))
+            if load_enc_opt and "encoder_optimizer_state_dict" in loaded_dict:
+                self.encoder_optimizer.load_state_dict(loaded_dict["encoder_optimizer_state_dict"])
+            if self._encoder_follow_policy_lr:
+                for param_group in self.encoder_optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
@@ -534,7 +606,16 @@ class PPO:
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], storage_obs, [env.num_actions], device)
+        decoder_target_dim = int(getattr(actor, "decoder_target_dim", 0))
+        storage = RolloutStorage(
+            "rl",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            storage_obs,
+            [env.num_actions],
+            device,
+            decoder_target_dim=decoder_target_dim,
+        )
 
         # Initialize the algorithm
         alg: PPO = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
@@ -571,13 +652,25 @@ class PPO:
             for tensor in model.state_dict().values():
                 torch.distributed.broadcast(tensor, src=0)
 
+    def _actor_policy_parameters(self) -> list[nn.Parameter]:
+        """Return actor parameters updated by the main PPO optimizer."""
+        if hasattr(self._raw_actor, "policy_parameters"):
+            return list(self._raw_actor.policy_parameters())
+        return list(self.actor.parameters())
+
+    def _actor_encoder_parameters(self) -> list[nn.Parameter]:
+        """Return auxiliary encoder/decoder parameters updated by encoder_optimizer."""
+        if hasattr(self._raw_actor, "encoder_parameters"):
+            return list(self._raw_actor.encoder_parameters())
+        return []
+
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
 
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
-        params = chain(self.actor.parameters(), self.critic.parameters())
+        params = chain(self._actor_policy_parameters(), self.critic.parameters())
         if self.rnd:
             params = chain(params, self.rnd.parameters())
         # Average the gradients across all GPUs in bounded buckets

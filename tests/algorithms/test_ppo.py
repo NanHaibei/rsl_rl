@@ -825,3 +825,126 @@ class TestSharedCNNEncoders:
         assert ppo.optimizer.state[shared]["step"] == 1
         # The first Adam step moves each parameter by the learning rate
         torch.testing.assert_close((before - shared.detach()).abs().max().item(), 1e-3, atol=1e-6, rtol=0)
+
+
+class TestEstimatorModelsWithPPO:
+    """Tests for PPO integration with AEModel and VAEModel."""
+
+    @staticmethod
+    def _make_estimator_ppo(
+        class_name: str,
+        num_latent: int,
+        use_mixed_precision: bool = False,
+    ) -> tuple[PPO, TensorDict, dict]:
+        obs = TensorDict(
+            {
+                "policy": torch.randn(NUM_ENVS, 4, 6),
+                "critic_vel": torch.randn(NUM_ENVS, 3),
+                "critic_prop": torch.randn(NUM_ENVS, 5),
+                "critic_other": torch.randn(NUM_ENVS, 4),
+            },
+            batch_size=[NUM_ENVS],
+        )
+        cfg = {
+            "num_steps_per_env": 4,
+            "multi_gpu": None,
+            "obs_groups": {
+                "actor": ["policy"],
+                "critic": ["critic_vel", "critic_prop", "critic_other"],
+                "critic_vel": ["critic_vel"],
+                "critic_prop": ["critic_prop"],
+            },
+            "algorithm": {
+                "class_name": "PPO",
+                "num_learning_epochs": 2,
+                "num_mini_batches": 2,
+                "learning_rate": 1e-3,
+                "schedule": "fixed",
+                "use_mixed_precision": use_mixed_precision,
+            },
+            "actor": {
+                "class_name": class_name,
+                "hidden_dims": [32, 16],
+                "encoder_hidden_dims": [32, 16],
+                "decoder_hidden_dims": [16, 32],
+                "num_latent": num_latent,
+                "activation": "elu",
+                "obs_normalization": True,
+                "distribution_cfg": {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
+            },
+            "critic": {
+                "class_name": "MLPModel",
+                "hidden_dims": [32, 16],
+                "activation": "elu",
+                "obs_normalization": True,
+            },
+        }
+        ppo = PPO.construct_algorithm(obs, SimpleNamespace(num_envs=NUM_ENVS, num_actions=NUM_ACTIONS), cfg, "cpu")
+        return ppo, obs, cfg
+
+    @pytest.mark.parametrize("class_name", ["AEModel", "VAEModel"])
+    @pytest.mark.parametrize("num_latent", [0, 8])
+    def test_rollout_update_and_checkpoint_roundtrip(self, class_name: str, num_latent: int) -> None:
+        ppo, obs, cfg = self._make_estimator_ppo(class_name, num_latent)
+        assert ppo.encoder_optimizer is not None
+        main_ids = {id(p) for g in ppo.optimizer.param_groups for p in g["params"]}
+        enc_ids = {id(p) for g in ppo.encoder_optimizer.param_groups for p in g["params"]}
+        assert main_ids.isdisjoint(enc_ids)
+
+        if num_latent == 0:
+            assert ppo.storage.next_decoder_obs is None
+        else:
+            assert ppo.storage.next_decoder_obs is not None
+
+        policy_before = [p.detach().clone() for p in ppo._actor_policy_parameters()]
+        enc_before = [p.detach().clone() for p in ppo._actor_encoder_parameters()]
+
+        for _ in range(cfg["num_steps_per_env"]):
+            ppo.act(obs)
+            next_obs = obs.clone()
+            next_obs["critic_prop"] = torch.full((NUM_ENVS, 5), 2.0)
+            terminal_obs = obs.clone()
+            terminal_obs["critic_prop"] = torch.full((NUM_ENVS, 5), 9.0)
+            dones = torch.tensor([1, 0, 0, 0], dtype=torch.long)
+            ppo.process_env_step(next_obs, torch.ones(NUM_ENVS), dones, {"final_obs": terminal_obs})
+            if num_latent > 0:
+                recorded = ppo.storage.next_decoder_obs[ppo.storage.step - 1]
+                torch.testing.assert_close(recorded[0], torch.full((5,), 9.0))
+                torch.testing.assert_close(recorded[1], torch.full((5,), 2.0))
+
+        ppo.compute_returns(obs)
+        metrics = ppo.update()
+        assert "vel_loss" in metrics and "encoder_total_loss" in metrics
+        if num_latent > 0:
+            assert "prop_loss" in metrics
+            if class_name == "VAEModel":
+                assert "kl_loss" in metrics
+        assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
+        assert any(not torch.equal(a, b) for a, b in zip(policy_before, ppo._actor_policy_parameters()))
+        assert any(not torch.equal(a, b) for a, b in zip(enc_before, ppo._actor_encoder_parameters()))
+
+        # Checkpoint roundtrip including encoder optimizer state and IsaacLab-style partial load_cfg.
+        saved = copy.deepcopy(ppo.save())
+        assert "encoder_optimizer_state_dict" in saved
+
+        restored, _, _ = self._make_estimator_ppo(class_name, num_latent)
+        restored.load(saved, None, True)
+        assert len(restored.encoder_optimizer.state_dict()["state"]) > 0
+
+        fresh_opt, _, _ = self._make_estimator_ppo(class_name, num_latent)
+        fresh_opt.load(saved, {"actor": True, "critic": True, "optimizer": False, "iteration": True, "rnd": True}, True)
+        assert len(fresh_opt.encoder_optimizer.state_dict()["state"]) == 0
+
+    def test_missing_final_obs_masks_done_transitions(self) -> None:
+        ppo, obs, _ = self._make_estimator_ppo("VAEModel", num_latent=8)
+        ppo.act(obs)
+        ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.ones(NUM_ENVS, dtype=torch.long), {})
+        assert ppo.storage.next_decoder_valid is not None
+        assert not ppo.storage.next_decoder_valid[0].any()
+
+        for _ in range(3):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.ones(NUM_ENVS, dtype=torch.long), {})
+        ppo.compute_returns(obs)
+        metrics = ppo.update()
+        assert metrics["prop_loss"] == pytest.approx(0.0)

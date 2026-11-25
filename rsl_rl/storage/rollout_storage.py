@@ -60,6 +60,13 @@ class RolloutStorage:
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
             """Hidden states for recurrent networks, e.g., (actor, critic)."""
 
+            # For auxiliary next-step decoder targets (e.g., AEModel / VAEModel)
+            self.next_decoder_obs: torch.Tensor | None = None
+            """Next-step decoder target observations."""
+
+            self.next_decoder_valid: torch.Tensor | None = None
+            """Validity mask for next-step decoder targets."""
+
         def clear(self) -> None:
             """Reset all transition fields to None."""
             self.__init__()
@@ -84,6 +91,8 @@ class RolloutStorage:
             masks: torch.Tensor | None = None,
             privileged_actions: torch.Tensor | None = None,
             dones: torch.Tensor | None = None,
+            next_decoder_obs: torch.Tensor | None = None,
+            next_decoder_valid: torch.Tensor | None = None,
         ) -> None:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
@@ -122,6 +131,12 @@ class RolloutStorage:
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
 
+            self.next_decoder_obs: torch.Tensor | None = next_decoder_obs
+            """Batch of next-step decoder target observations."""
+
+            self.next_decoder_valid: torch.Tensor | None = next_decoder_valid
+            """Batch of validity masks for next-step decoder targets."""
+
     def __init__(
         self,
         training_type: str,
@@ -130,6 +145,7 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        decoder_target_dim: int = 0,
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
@@ -162,6 +178,19 @@ class RolloutStorage:
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            if decoder_target_dim > 0:
+                self.next_decoder_obs: torch.Tensor | None = torch.zeros(
+                    num_transitions_per_env, num_envs, decoder_target_dim, device=self.device
+                )
+                self.next_decoder_valid: torch.Tensor | None = torch.ones(
+                    num_transitions_per_env, num_envs, 1, dtype=torch.bool, device=self.device
+                )
+            else:
+                self.next_decoder_obs = None
+                self.next_decoder_valid = None
+        else:
+            self.next_decoder_obs = None
+            self.next_decoder_valid = None
 
         # For recurrent networks
         self.saved_hidden_state_a = None
@@ -197,6 +226,11 @@ class RolloutStorage:
                 )
             for i, p in enumerate(transition.distribution_params):  # type: ignore
                 self.distribution_params[i][self.step].copy_(p)
+            if self.next_decoder_obs is not None and self.next_decoder_valid is not None:
+                if transition.next_decoder_obs is None or transition.next_decoder_valid is None:
+                    raise ValueError("next_decoder_obs and next_decoder_valid are required in transition.")
+                self.next_decoder_obs[self.step].copy_(transition.next_decoder_obs)
+                self.next_decoder_valid[self.step].copy_(transition.next_decoder_valid)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -239,6 +273,8 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        next_decoder_obs = self.next_decoder_obs.flatten(0, 1) if self.next_decoder_obs is not None else None
+        next_decoder_valid = self.next_decoder_valid.flatten(0, 1) if self.next_decoder_valid is not None else None
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -256,6 +292,8 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    next_decoder_obs=next_decoder_obs[batch_idx] if next_decoder_obs is not None else None,
+                    next_decoder_valid=next_decoder_valid[batch_idx] if next_decoder_valid is not None else None,
                 )
 
     # For reinforcement learning with recurrent networks
